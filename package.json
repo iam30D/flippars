@@ -1,0 +1,48 @@
+{
+  "name": "flippars",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Auditable, abstention-first Bitcoin market signal platform.",
+  "engines": {
+    "node": ">=20.19 <21"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "overrides": {
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "react-native-gesture-handler": "2.31.2",
+    "react-native-reanimated": "4.3.1",
+    "react-native-worklets": "0.8.3"
+  },
+  "scripts": {
+    "build": "npm run build:shared && npm run build --workspace @flippars/model-lab && npm run build --workspace @flippars/api && npm run build --workspace @flippars/mobile",
+    "build:shared": "npm run build --workspace @flippars/contracts && npm run build --workspace @flippars/signal-core",
+    "clean": "npm run clean --workspaces --if-present",
+    "dev:api": "npm run dev --workspace @flippars/api",
+    "dev:mobile": "npm run start --workspace @flippars/mobile",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "npm run build:shared && eslint . --max-warnings=0",
+    "test": "npm run build:shared && npm run test --workspaces --if-present",
+    "typecheck": "npm run build:shared && npm run typecheck --workspaces --if-present",
+    "repo:check": "node scripts/check-repository.mjs",
+    "verify": "npm run repo:check && npm run format:check && npm run lint && npm run typecheck && npm run test && npm run build"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.1",
+    "eslint": "^9.39.1",
+    "eslint-config-prettier": "^10.1.8",
+    "globals": "^16.5.0",
+    "prettier": "^3.7.4",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "react-native-gesture-handler": "2.31.2",
+    "react-native-reanimated": "4.3.1",
+    "react-native-worklets": "0.8.3",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.48.1"
+  }
+}

@@ -1,0 +1,59 @@
+name: flippars
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: flippars
+      POSTGRES_USER: flippars
+      POSTGRES_PASSWORD: local-development-only
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flippars -d flippars"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    volumes:
+      - flippars-postgres:/var/lib/postgresql/data
+
+  migrate:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    command: ["node", "dist/src/db/migrate.js"]
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgresql://flippars:local-development-only@postgres:5432/flippars
+      DATABASE_SSL: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    environment:
+      NODE_ENV: development
+      HOST: 0.0.0.0
+      PORT: 8080
+      DATABASE_URL: postgresql://flippars:local-development-only@postgres:5432/flippars
+      DATABASE_SSL: "false"
+      MARKET_FEEDS: simulated
+      SIMULATED_FEED_ENABLED: "true"
+      MARKET_MIN_HEALTHY_VENUES: "1"
+      REQUIRE_MARKET_FOR_READINESS: "false"
+      SIGNALS_ENABLED: "false"
+      APNS_ENABLED: "false"
+      LOG_LEVEL: info
+    ports:
+      - "8080:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  flippars-postgres:

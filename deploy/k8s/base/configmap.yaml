@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flippars-api
+data:
+  NODE_ENV: production
+  HOST: 0.0.0.0
+  PORT: "8080"
+  LOG_LEVEL: info
+  MARKET_FEEDS: coinbase,kraken,binance
+  SIMULATED_FEED_ENABLED: "false"
+  MARKET_MIN_HEALTHY_VENUES: "3"
+  REQUIRE_MARKET_FOR_READINESS: "true"
+  SIGNALS_ENABLED: "false"
+  APNS_ENABLED: "false"
