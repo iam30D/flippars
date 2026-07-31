@@ -18,7 +18,7 @@
     "expo": "~56.0.12",
     "expo-constants": "~56.0.22",
     "expo-crypto": "~56.0.4",
-    "expo-device": "~56.0.4",
+    "expo-device": "~57.0.1",
     "expo-linking": "~56.0.16",
     "expo-notifications": "~56.0.22",
     "expo-router": "~56.2.17",
