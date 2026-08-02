@@ -6,10 +6,12 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$env:PYTHON_BASIC_REPL = "1"
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $selectedPythonVersion = $PythonVersion
 $pythonCommand = "py"
 $pythonCommandArguments = @()
+Write-Host "Detecting an installed Python runtime..."
 if ($PythonVersion -eq "auto") {
   foreach ($candidate in @("3.11", "3.12", "3.13", "3.14")) {
     try {
@@ -65,10 +67,12 @@ New-Item -ItemType Directory -Force -Path (Join-Path $TrainingRoot "data\process
 New-Item -ItemType Directory -Force -Path (Join-Path $TrainingRoot "artifacts\draft") | Out-Null
 
 if (-not (Test-Path -LiteralPath $pythonPath)) {
+  Write-Host "Creating Python virtual environment..."
   & $pythonCommand @pythonCommandArguments -m venv $venvPath
   if ($LASTEXITCODE -ne 0) { throw "Python virtual environment creation failed." }
 }
 
+Write-Host "Installing model-training dependencies..."
 & $pythonPath -m pip install --upgrade pip
 if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed." }
 
