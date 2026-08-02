@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
   [string]$TrainingRoot = (Join-Path $env:USERPROFILE "Flippars-ml"),
-  [ValidatePattern("^(auto|3\\.\\d+)$")]
+  [ValidatePattern("^(auto|3\.\d+)$")]
   [string]$PythonVersion = "auto"
 )
 
