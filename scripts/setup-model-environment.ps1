@@ -8,12 +8,30 @@ param(
 $ErrorActionPreference = "Stop"
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $selectedPythonVersion = $PythonVersion
+$pythonCommand = "py"
+$pythonCommandArguments = @()
 if ($PythonVersion -eq "auto") {
   foreach ($candidate in @("3.11", "3.12", "3.13", "3.14")) {
-    & py "-$candidate" --version *> $null
-    if ($LASTEXITCODE -eq 0) {
-      $selectedPythonVersion = $candidate
-      break
+    try {
+      & py "-$candidate" --version 2>$null | Out-Null
+      if ($LASTEXITCODE -eq 0) {
+        $selectedPythonVersion = $candidate
+        $pythonCommandArguments = @("-$candidate")
+        break
+      }
+    } catch {
+      continue
+    }
+  }
+  if ($selectedPythonVersion -eq "auto") {
+    try {
+      $directVersion = & python --version 2>$null
+      if ($LASTEXITCODE -eq 0 -and $directVersion -match "Python\s+(3\.\d+)") {
+        $selectedPythonVersion = $Matches[1]
+        $pythonCommand = "python"
+      }
+    } catch {
+      # The final error below explains how to install Python.
     }
   }
 }
@@ -22,8 +40,12 @@ if ($selectedPythonVersion -eq "auto") {
   throw "No supported Python 3.x runtime was found. Install Python 3.11 or newer, then run this script again."
 }
 
-$pythonLauncherArguments = @("-$selectedPythonVersion")
-& py @pythonLauncherArguments --version | Out-Host
+$pythonCommandArguments = if ($pythonCommand -eq "py") {
+  @("-$selectedPythonVersion")
+} else {
+  @()
+}
+& $pythonCommand @pythonCommandArguments --version | Out-Host
 if ($LASTEXITCODE -ne 0) {
   throw "Python $selectedPythonVersion was not found. Install it with the Python Launcher, then run this script again."
 }
@@ -43,7 +65,7 @@ New-Item -ItemType Directory -Force -Path (Join-Path $TrainingRoot "data\process
 New-Item -ItemType Directory -Force -Path (Join-Path $TrainingRoot "artifacts\draft") | Out-Null
 
 if (-not (Test-Path -LiteralPath $pythonPath)) {
-  & py @pythonLauncherArguments -m venv $venvPath
+  & $pythonCommand @pythonCommandArguments -m venv $venvPath
   if ($LASTEXITCODE -ne 0) { throw "Python virtual environment creation failed." }
 }
 
