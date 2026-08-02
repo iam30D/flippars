@@ -47,6 +47,27 @@ volume. No component may place trades or accept exchange credentials.
 - Tests accompany boundary rules, failure behavior, and regressions.
 - Record deliberate deferrals in `TECH_DEBT.md`; never hide them as TODOs.
 
+## Never commit or push
+
+- Real environment files (`.env`, `.env.local`, `.env.production`, or any other
+  `.env.*`) or secret-manager exports. Only reviewed templates named
+  `.env.example` or `.env.production.example` may be tracked.
+- Database passwords/URLs, APNs `.p8` keys, Apple certificates, provisioning
+  profiles, EAS/Expo access tokens, device push tokens, encryption keys, or
+  credential files such as `credentials.json`.
+- Generated/local Expo and native state: `.expo/`, `.eas/`, `expo-env.d.ts`,
+  generated `ios/` or `android/` directories, simulator/device registrations,
+  or locally downloaded signing material.
+- Dependencies and generated output: `node_modules/`, `dist/`, `coverage/`,
+  logs, caches, temporary files, or local database volumes/backups.
+- Proprietary/raw datasets, replay captures, trained model binaries, unsigned or
+  signed production artifacts, and local `data/`, `models/`, or `artifacts/`
+  content. Only small, synthetic, explicitly reviewed test fixtures are allowed.
+
+Before every commit and push, inspect staged paths and run the repository secret
+check. If a sensitive file was staged, unstage it and rotate any exposed secret;
+deleting it from the latest commit is not sufficient once it has been pushed.
+
 ## Folder conventions
 
 - `apps/` contains independently deployable applications.

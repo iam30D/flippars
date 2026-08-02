@@ -21,6 +21,7 @@ import {
 
 export class InMemoryRepository implements Repository {
   readonly devices = new Map<string, DeviceRecord>();
+  readonly deviceCredentialHashes = new Map<string, string>();
   readonly preferences = new Map<string, PreferencesRecord>();
   readonly signals = new Map<string, SignalRecord>();
   readonly models = new Map<SignalType, ModelRecord>();
@@ -39,27 +40,56 @@ export class InMemoryRepository implements Repository {
     return this.available;
   }
 
-  async upsertDevice(input: UpsertDeviceInput): Promise<DeviceRecord> {
+  async upsertDevice(input: UpsertDeviceInput): Promise<DeviceRecord | null> {
     const now = new Date().toISOString();
     const existing = this.devices.get(input.id);
+    const existingCredentialHash = this.deviceCredentialHashes.get(input.id);
+    if (
+      existing &&
+      existingCredentialHash &&
+      existingCredentialHash !== input.credentialHash
+    )
+      return null;
     const device: DeviceRecord = {
-      ...input,
+      id: input.id,
+      platform: input.platform,
+      pushToken: input.pushToken,
+      pushEnvironment: input.pushEnvironment,
+      notificationsAuthorized: input.notificationsAuthorized,
+      appVersion: input.appVersion,
+      locale: input.locale,
+      timezone: input.timezone,
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
       lastSeenAt: now,
     };
     this.devices.set(input.id, device);
+    this.deviceCredentialHashes.set(input.id, input.credentialHash);
     if (!this.preferences.has(input.id))
       this.preferences.set(input.id, defaultPreferences(input.id, now));
     return structuredClone(device);
   }
 
-  async deleteDevice(id: string): Promise<boolean> {
+  async verifyDeviceCredential(id: string, credentialHash: string): Promise<boolean> {
+    return (
+      this.devices.has(id) && this.deviceCredentialHashes.get(id) === credentialHash
+    );
+  }
+
+  async deleteDevice(
+    id: string,
+    credentialHash: string,
+  ): Promise<"deleted" | "not_found" | "credential_mismatch"> {
+    if (!this.devices.has(id)) return "not_found";
+    const stored = this.deviceCredentialHashes.get(id);
+    if (stored && stored !== credentialHash) return "credential_mismatch";
     this.preferences.delete(id);
     for (const key of [...this.notificationClaims]) {
       if (key.startsWith(`${id}:`)) this.notificationClaims.delete(key);
     }
-    return this.devices.delete(id);
+    this.devices.delete(id);
+    this.deviceCredentialHashes.delete(id);
+    return "deleted";
   }
 
   async putPreferences(input: PutPreferencesInput): Promise<PreferencesRecord> {

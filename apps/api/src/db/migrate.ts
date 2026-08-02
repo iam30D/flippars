@@ -5,10 +5,19 @@ import { Pool } from "pg";
 import { loadConfig } from "../config.js";
 import { loadLocalEnvironment } from "../environment.js";
 
-export async function runMigrations(databaseUrl: string, ssl = false): Promise<void> {
+export async function runMigrations(
+  databaseUrl: string,
+  ssl = false,
+  caCert?: string,
+): Promise<void> {
   const pool = new Pool({
     connectionString: databaseUrl,
-    ssl: ssl ? { rejectUnauthorized: true } : undefined,
+    ssl: ssl
+      ? {
+          rejectUnauthorized: true,
+          ...(caCert ? { ca: caCert } : {}),
+        }
+      : undefined,
   });
   const client = await pool.connect();
   try {
@@ -55,6 +64,6 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   loadLocalEnvironment();
   const config = loadConfig();
   if (!config.databaseUrl) throw new Error("DATABASE_URL is required to migrate");
-  await runMigrations(config.databaseUrl, config.databaseSsl);
+  await runMigrations(config.databaseUrl, config.databaseSsl, config.databaseCaCert);
   process.stdout.write("Database migrations complete.\n");
 }

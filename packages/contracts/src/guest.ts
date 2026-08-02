@@ -3,9 +3,17 @@ import { z } from "zod";
 import { Rfc3339TimestampSchema } from "./primitives.js";
 import { SignalTypeSchema } from "./signal.js";
 
+export const GUEST_INSTALLATION_ID_HEADER = "X-Flippars-Installation-ID";
+export const GUEST_CREDENTIAL_HEADER = "X-Flippars-Guest-Credential";
+
+export const GuestInstallationIdSchema = z.string().uuid();
+export const GuestCredentialSchema = z
+  .string()
+  .regex(/^[a-f0-9]{64}$/, "Expected a 256-bit hexadecimal guest credential");
+
 export const GuestDeviceSchema = z
   .object({
-    installationId: z.string().uuid(),
+    installationId: GuestInstallationIdSchema,
     platform: z.literal("IOS"),
     appVersion: z.string().min(1).max(40),
     locale: z.string().min(2).max(35),
@@ -34,7 +42,7 @@ export type QuietHours = z.infer<typeof QuietHoursSchema>;
 
 export const GuestPreferencesSchema = z
   .object({
-    installationId: z.string().uuid(),
+    installationId: GuestInstallationIdSchema,
     enabledSignalTypes: z.array(SignalTypeSchema).min(1),
     notificationsEnabled: z.boolean(),
     minimumConfidence: z.number().min(0.5).max(1),

@@ -22,6 +22,7 @@ export interface SignalPage {
 
 export interface UpsertDeviceInput {
   id: string;
+  credentialHash: string;
   platform: "ios";
   pushToken: string | null;
   pushEnvironment: "sandbox" | "production";
@@ -30,6 +31,8 @@ export interface UpsertDeviceInput {
   locale: string;
   timezone: string;
 }
+
+export type DeleteDeviceResult = "deleted" | "not_found" | "credential_mismatch";
 
 export interface PutPreferencesInput {
   deviceId: string;
@@ -48,8 +51,9 @@ export interface NotificationTarget {
 
 export interface Repository {
   ping(): Promise<boolean>;
-  upsertDevice(input: UpsertDeviceInput): Promise<DeviceRecord>;
-  deleteDevice(id: string): Promise<boolean>;
+  upsertDevice(input: UpsertDeviceInput): Promise<DeviceRecord | null>;
+  verifyDeviceCredential(id: string, credentialHash: string): Promise<boolean>;
+  deleteDevice(id: string, credentialHash: string): Promise<DeleteDeviceResult>;
   putPreferences(input: PutPreferencesInput): Promise<PreferencesRecord>;
   getPreferences(deviceId: string): Promise<PreferencesRecord | null>;
   notificationTargets(signal: SignalRecord): Promise<NotificationTarget[]>;
@@ -95,7 +99,7 @@ export function defaultPreferences(
 ): PreferencesRecord {
   return {
     deviceId,
-    notificationsEnabled: true,
+    notificationsEnabled: false,
     signalTypes: [
       "five_minute_reversal",
       "fifteen_minute_reversal",

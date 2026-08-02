@@ -28,8 +28,10 @@ export default function SettingsRoute(): React.JSX.Element {
     demoMode,
     preferences,
     notificationStatus,
+    notificationsOptedIn,
     updatePreferences,
     enableNotifications,
+    disableNotifications,
     resetAnonymousData,
   } = useApp();
   const router = useRouter();
@@ -57,7 +59,14 @@ export default function SettingsRoute(): React.JSX.Element {
           text: "Delete and reset",
           style: "destructive",
           onPress: () => {
-            void resetAnonymousData().then(() => router.replace("/onboarding"));
+            void resetAnonymousData()
+              .then(() => router.replace("/onboarding"))
+              .catch(() => {
+                Alert.alert(
+                  "Reset could not finish",
+                  "Your secure deletion request was kept for retry. Please try again after reconnecting.",
+                );
+              });
           },
         },
       ],
@@ -120,17 +129,25 @@ export default function SettingsRoute(): React.JSX.Element {
           <AppText weight="700">iOS permission</AppText>
           <Badge
             label={
-              notificationStatus === "granted"
+              notificationsOptedIn && notificationStatus === "granted"
                 ? "Enabled"
-                : notificationStatus === "unknown"
-                  ? "Not checked"
-                  : "Not enabled"
+                : notificationsOptedIn
+                  ? "Waiting for iOS"
+                  : notificationStatus === "unknown"
+                    ? "Not checked"
+                    : "Not enabled"
             }
-            symbol={notificationStatus === "granted" ? "✓" : "!"}
-            tone={notificationStatus === "granted" ? "positive" : "warning"}
+            symbol={
+              notificationsOptedIn && notificationStatus === "granted" ? "✓" : "!"
+            }
+            tone={
+              notificationsOptedIn && notificationStatus === "granted"
+                ? "positive"
+                : "warning"
+            }
           />
         </View>
-        {notificationStatus !== "granted" ? (
+        {!notificationsOptedIn ? (
           <Button
             variant="secondary"
             onPress={() => {
@@ -142,7 +159,16 @@ export default function SettingsRoute(): React.JSX.Element {
               ? "Open iOS Settings"
               : "Enable signal alerts"}
           </Button>
-        ) : null}
+        ) : (
+          <Button
+            variant="secondary"
+            onPress={() => {
+              void disableNotifications();
+            }}
+          >
+            Disable signal alerts
+          </Button>
+        )}
       </Card>
 
       <SectionHeader

@@ -8,6 +8,10 @@ Nothing in this file authorizes bypassing a release gate.
   news datasets.
 - Complete the prospective shadow period for each signal type; no production
   model artifact is bundled.
+- Build and independently review the operator-only model registrar, complete
+  three-class production feature/runtime provider, prospective shadow recorder,
+  and canary integration. The checked-in verifier intentionally cannot promote
+  or enable a model.
 - Obtain jurisdiction-specific legal review for financial-promotion,
   subscription, privacy, and App Store wording.
 - Supply Apple Developer, APNs, EAS, and App Store Connect credentials through
@@ -15,6 +19,12 @@ Nothing in this file authorizes bypassing a release gate.
 - Complete independent mobile/API penetration testing and remediate findings.
 - Choose the production cloud and convert the portable Kubernetes baseline into
   reviewed provider-specific infrastructure.
+- Add durable cross-pod signal/outcome fan-out or approve and enforce a measured
+  single-writer topology before any multi-replica signal emission. The current
+  WebSocket hub is process-local.
+- Approve the production retention schedule for audit, signal, outcome, dormant
+  guest, and backup data; the bounded job currently deletes only expired market
+  observations and notification-delivery records.
 - Track the moderate `uuid` advisory inherited by Expo's native build tooling;
   npm currently proposes a breaking Expo downgrade rather than a compatible
   remediation. The production high-severity audit gate remains clean.

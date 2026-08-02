@@ -23,9 +23,14 @@
   outcome scoring, health gates, anomaly abstention, and immutable signal
   behavior have automated coverage.
 - Repository-wide verification is complete: structure/secret checks,
-  formatting, strict lint, all workspace type checks, 56 automated tests, and
-  the iOS production export pass.
-- Publication to the approved GitHub `main` branch is in progress.
+  formatting, strict lint, all workspace type checks, 20 API tests, 24 mobile
+  tests, 6 contracts tests, 6 model-artifact tests, 3 model-lab tests, 23
+  signal-core tests, and the iOS production export pass.
+- Guest mutation proof, explicit notification opt-in, offline deletion
+  tombstones, production environment guards, bounded retention, and the
+  offline-only model-bundle verifier are implemented. Signals remain disabled.
+- Publication to GitHub is pending final credentialed push from the release
+  operator.
 
 ## Pending release inputs
 
@@ -33,10 +38,14 @@
 - Licensed data vendors and budget.
 - Apple/EAS/APNs production credentials.
 - Approved model artifacts after prospective validation.
+- Cloud-specific ingress/TLS/secret-manager configuration and an operational
+  owner for the Kubernetes baseline.
 
 ## Known limitations
 
 - No honest production win rate exists before the shadow validation period.
+- No production model provider, registrar, live shadow recorder, or durable
+  cross-pod signal fan-out is bundled.
 - APNs delivery to a device is best effort; alerts include expiration.
 - Public data can identify anomalies but cannot prove manipulative intent.
 
@@ -51,6 +60,9 @@
 
 ## Changelog
 
+- 2026-08-02: Completed the guest-first production-readiness implementation,
+  governed model-bundle verifier, deployment/retention baseline, beginner
+  build/production guides, and full repository verification.
 - 2026-07-31: User approved the full implementation plan and repository
   publication.
 - 2026-07-31: Implemented the guest-first full stack, deterministic signal

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
+  GuestCredentialSchema,
   MarketSnapshotSchema,
   PositiveDecimalStringSchema,
   Rfc3339TimestampSchema,
@@ -11,6 +12,12 @@ import {
 } from "./index.js";
 
 describe("wire primitives", () => {
+  it("accepts only canonical 256-bit guest credentials", () => {
+    assert.equal(GuestCredentialSchema.safeParse("a".repeat(64)).success, true);
+    assert.equal(GuestCredentialSchema.safeParse("A".repeat(64)).success, false);
+    assert.equal(GuestCredentialSchema.safeParse("a".repeat(63)).success, false);
+  });
+
   it("accepts canonical positive decimal strings and rejects JSON numbers", () => {
     assert.equal(PositiveDecimalStringSchema.safeParse("67420.125").success, true);
     assert.equal(PositiveDecimalStringSchema.safeParse("0.0001").success, true);

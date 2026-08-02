@@ -19,7 +19,7 @@
   },
   "scripts": {
     "build": "npm run build:shared && npm run build --workspace @flippars/model-lab && npm run build --workspace @flippars/api && npm run build --workspace @flippars/mobile",
-    "build:shared": "npm run build --workspace @flippars/contracts && npm run build --workspace @flippars/signal-core",
+    "build:shared": "npm run build --workspace @flippars/contracts && npm run build --workspace @flippars/signal-core && npm run build --workspace @flippars/model-artifact",
     "clean": "npm run clean --workspaces --if-present",
     "dev:api": "npm run dev --workspace @flippars/api",
     "dev:mobile": "npm run start --workspace @flippars/mobile",

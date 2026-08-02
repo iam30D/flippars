@@ -10,6 +10,8 @@ data:
   MARKET_FEEDS: coinbase,kraken,binance
   SIMULATED_FEED_ENABLED: "false"
   MARKET_MIN_HEALTHY_VENUES: "3"
-  REQUIRE_MARKET_FOR_READINESS: "true"
+  # Public reads stay available during provider degradation; signal policy still abstains.
+  REQUIRE_MARKET_FOR_READINESS: "false"
   SIGNALS_ENABLED: "false"
+  MODEL_PROVIDER: disabled
   APNS_ENABLED: "false"

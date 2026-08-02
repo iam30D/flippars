@@ -125,7 +125,14 @@ function createRepository(): Repository {
   return new PostgresRepository(
     {
       connectionString: config.databaseUrl,
-      ...(config.databaseSsl ? { ssl: { rejectUnauthorized: true } } : {}),
+      ...(config.databaseSsl
+        ? {
+            ssl: {
+              rejectUnauthorized: true,
+              ...(config.databaseCaCert ? { ca: config.databaseCaCert } : {}),
+            },
+          }
+        : {}),
     },
     config.deviceTokenEncryptionKey,
   );
