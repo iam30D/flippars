@@ -1,6 +1,6 @@
 """Safe, offline-first Binance trade collection and draft training pipeline.
 
-The collector uses Binance Data Vision's object listing and download endpoint.
+The collector uses Binance Data Vision's documented daily archive paths.
 It does not use exchange credentials or trading endpoints. Raw data and model
 artifacts must live outside the Git repository.
 
@@ -21,6 +21,7 @@ import math
 import re
 import shutil
 import tempfile
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
@@ -230,27 +231,26 @@ def collect_daily_archives(
     requested_days = (end - start).days
     if requested_days > max_files:
         raise ValueError(f"requested {requested_days} files, exceeding --max-files={max_files}")
-    prefix = f"data/spot/daily/trades/{symbol}/"
-    keys = list_listing_keys(base_url, prefix)
     archive_root = raw_root / "archives"
     archive_root.mkdir(parents=True, exist_ok=True)
     results: list[Path] = []
-    for key in keys:
-        match = DATE_PATTERN.search(key)
-        if match is None or match.group("symbol") != symbol:
-            continue
-        day = date.fromisoformat(match.group("day"))
-        if not (start <= day < end):
-            continue
-        target = archive_root / Path(key).name
+    missing: list[str] = []
+    for offset in range(requested_days):
+        day = start + timedelta(days=offset)
+        filename = f"{symbol}-trades-{day.isoformat()}.zip"
+        key = f"data/spot/daily/trades/{symbol}/{filename}"
+        target = archive_root / filename
         if target.exists() and not overwrite:
             results.append(target)
             continue
-        download_atomic(join_url(base_url, key), target)
+        try:
+            download_atomic(join_url(base_url, key), target)
+        except urllib.error.HTTPError as error:
+            if error.code in {403, 404}:
+                missing.append(day.isoformat())
+                continue
+            raise
         results.append(target)
-    expected = {(start + timedelta(days=offset)).isoformat() for offset in range(requested_days)}
-    found = {DATE_PATTERN.search(path.name).group("day") for path in results if DATE_PATTERN.search(path.name)}
-    missing = sorted(expected - found)
     if missing:
         raise RuntimeError(f"Binance listing did not contain requested dates: {', '.join(missing)}")
     return sorted(results)

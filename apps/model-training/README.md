@@ -2,8 +2,9 @@
 
 This package is a repository-side implementation of the offline training
 workflow. The Python environment, raw exchange data, and model artifacts must
-remain outside Git. The collector uses Binance Data Vision's object listing and
-download endpoint; it does not use trading credentials or place orders.
+remain outside Git. The collector uses Binance Data Vision's documented daily
+archive paths and download endpoint; it does not use trading credentials or
+place orders.
 
 **Publication boundary:** the source code may be committed only after explicit
 owner approval. Provider permits must be recorded before production release.
