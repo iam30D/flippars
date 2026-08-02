@@ -348,7 +348,12 @@ def parse_trade_row(row: Sequence[str], source_file: str) -> Trade | None:
         else:
             return None
         timestamp_value = float(timestamp)
-        if timestamp_value > 10_000_000_000:
+        # Binance spot trade archives use milliseconds before 2025 and
+        # microseconds from 2025-01-01 onward. Normalize either unit to
+        # POSIX seconds before constructing the UTC event timestamp.
+        if timestamp_value > 1_000_000_000_000_000:
+            timestamp_value /= 1_000_000
+        elif timestamp_value > 10_000_000_000:
             timestamp_value /= 1_000
         event_time = datetime.fromtimestamp(timestamp_value, tz=UTC)
         price_value = float(price)
