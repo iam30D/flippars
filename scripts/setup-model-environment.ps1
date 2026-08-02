@@ -1,17 +1,34 @@
 [CmdletBinding()]
 param(
   [string]$TrainingRoot = (Join-Path $env:USERPROFILE "Flippars-ml"),
-  [ValidatePattern("^3\\.\\d+$")]
-  [string]$PythonVersion = "3.11"
+  [ValidatePattern("^(auto|3\\.\\d+)$")]
+  [string]$PythonVersion = "auto"
 )
 
 $ErrorActionPreference = "Stop"
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$pythonLauncherArguments = @("-$PythonVersion")
+$selectedPythonVersion = $PythonVersion
+if ($PythonVersion -eq "auto") {
+  foreach ($candidate in @("3.11", "3.12", "3.13", "3.14")) {
+    & py "-$candidate" --version *> $null
+    if ($LASTEXITCODE -eq 0) {
+      $selectedPythonVersion = $candidate
+      break
+    }
+  }
+}
 
+if ($selectedPythonVersion -eq "auto") {
+  throw "No supported Python 3.x runtime was found. Install Python 3.11 or newer, then run this script again."
+}
+
+$pythonLauncherArguments = @("-$selectedPythonVersion")
 & py @pythonLauncherArguments --version | Out-Host
 if ($LASTEXITCODE -ne 0) {
-  throw "Python $PythonVersion was not found. Install Python $PythonVersion with the Python Launcher, then run this script again."
+  throw "Python $selectedPythonVersion was not found. Install it with the Python Launcher, then run this script again."
+}
+if ($selectedPythonVersion -ne "3.11") {
+  Write-Warning "Python $selectedPythonVersion selected. Python 3.11 remains the preferred baseline when available."
 }
 
 $venvPath = Join-Path $TrainingRoot ".venv"
@@ -43,5 +60,6 @@ $lockPath = Join-Path $TrainingRoot "requirements.lock.txt"
 & $pythonPath -m pip freeze | Out-File -FilePath $lockPath -Encoding utf8
 
 Write-Host "Model-training environment is ready: $TrainingRoot"
+Write-Host "Selected Python version: $selectedPythonVersion"
 Write-Host "Python executable: $pythonPath"
 Write-Host "Run '$pythonPath -m flippars_model_training --help' for the collector and training commands."

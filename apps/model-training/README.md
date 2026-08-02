@@ -21,12 +21,13 @@ The setup installs model libraries, not a pre-trained Bitcoin checkpoint:
 From the repository root:
 
 ```powershell
+Set-Location C:\Users\<you>\Downloads\Flippars
 .\scripts\setup-model-environment.ps1
 ```
 
 The default training workspace is `C:\Users\<you>\Flippars-ml`. Use
-`-TrainingRoot` to select another directory. Python 3.11 is the supported
-baseline for the first release.
+`-TrainingRoot` to select another directory. The script prefers Python 3.11
+and automatically falls back to an installed Python 3.12–3.14 runtime.
 
 ## Collect and train in one command
 
