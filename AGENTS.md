@@ -63,6 +63,12 @@ volume. No component may place trades or accept exchange credentials.
 - Proprietary/raw datasets, replay captures, trained model binaries, unsigned or
   signed production artifacts, and local `data/`, `models/`, or `artifacts/`
   content. Only small, synthetic, explicitly reviewed test fixtures are allowed.
+- The Binance collector and model-training implementation (`apps/model-training/`
+  and `scripts/setup-model-environment.ps1`) may be staged, committed, and
+  pushed only after explicit owner approval. Provider permits must be recorded
+  before production release; keep all private data, contracts, credentials, and
+  generated artifacts in the separate training workspace described by that
+  package.
 
 Before every commit and push, inspect staged paths and run the repository secret
 check. If a sensitive file was staged, unstage it and rotate any exposed secret;

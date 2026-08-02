@@ -5,6 +5,10 @@ workflow. The Python environment, raw exchange data, and model artifacts must
 remain outside Git. The collector uses Binance Data Vision's object listing and
 download endpoint; it does not use trading credentials or place orders.
 
+**Publication boundary:** the source code may be committed only after explicit
+owner approval. Provider permits must be recorded before production release.
+Raw data, contracts, credentials, and generated artifacts remain outside Git.
+
 The setup installs model libraries, not a pre-trained Bitcoin checkpoint:
 
 - [LightGBM official source and MIT license](https://github.com/lightgbm-org/LightGBM)
