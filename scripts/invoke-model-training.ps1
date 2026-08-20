@@ -177,12 +177,7 @@ if ($Mode -eq 'FrozenDraft') {
       (($recordedFreeze -join "`n") -ne ($currentFreeze -join "`n"))) {
     throw 'Installed packages no longer match the final-environment snapshot.'
   }
-  $currentPythonCompatibilityJson = & $pythonPath -c 'import json,platform,sys,sysconfig; print(json.dumps({"implementation": platform.python_implementation(), "version": platform.python_version(), "cacheTag": sys.implementation.cache_tag, "platform": sysconfig.get_platform(), "machine": platform.machine()}))'
-  if ($LASTEXITCODE -ne 0) {
-    throw 'Unable to inspect the current Python runtime identity.'
-  }
-  $currentPythonCompatibility = ($currentPythonCompatibilityJson -join [Environment]::NewLine) |
-    ConvertFrom-Json
+  $currentPythonCompatibility = Get-PythonRuntimeCompatibility $pythonPath
   foreach ($field in @('implementation', 'version', 'cacheTag', 'platform', 'machine')) {
     if ([string]$currentPythonCompatibility.$field -ne
         [string]$environmentManifest.pythonCompatibility.$field) {

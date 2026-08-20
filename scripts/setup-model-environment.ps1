@@ -260,11 +260,8 @@ if ($LASTEXITCODE -ne 0) { throw 'Unable to record installed dependency metadata
   [System.Text.UTF8Encoding]::new($false)
 )
 
-$pythonRuntimeVersion = (& $pythonPath -c 'import platform; print(platform.python_version())').Trim()
-if ($LASTEXITCODE -ne 0) { throw 'Unable to record Python runtime version.' }
-$pythonCompatibilityJson = & $pythonPath -c 'import json,platform,sys,sysconfig; print(json.dumps({"implementation": platform.python_implementation(), "version": platform.python_version(), "cacheTag": sys.implementation.cache_tag, "platform": sysconfig.get_platform(), "machine": platform.machine()}))'
-if ($LASTEXITCODE -ne 0) { throw 'Unable to record Python runtime compatibility.' }
-$pythonCompatibility = ($pythonCompatibilityJson -join [Environment]::NewLine) | ConvertFrom-Json
+$pythonCompatibility = Get-PythonRuntimeCompatibility $pythonPath
+$pythonRuntimeVersion = [string]$pythonCompatibility.version
 if ($Mode -eq 'Locked') {
   foreach ($field in @('implementation', 'version', 'cacheTag', 'platform', 'machine')) {
     if ([string]$pythonCompatibility.$field -ne [string]$semanticLock.python.$field) {

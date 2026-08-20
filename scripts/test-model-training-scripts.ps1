@@ -106,6 +106,14 @@ Assert-Throws {
 
 Assert-NoTrackedTrainingMaterial $repositoryRoot
 
+$guardrailsText = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'model-training-guardrails.ps1') -Raw
+Assert-True ($guardrailsText.Contains('$probe | & $PythonPath -')) `
+  'Python runtime compatibility must be passed over stdin instead of a native command argument.'
+Assert-True ($guardrailsText.Contains('must contain exactly five fields')) `
+  'Python runtime compatibility must reject incomplete or expanded schemas.'
+Assert-True ($guardrailsText.Contains('must be a nonempty string')) `
+  'Python runtime compatibility must reject empty identity fields.'
+
 $setupText = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'setup-model-environment.ps1') -Raw
 Assert-True ($setupText.Contains('--no-index')) 'Locked setup must disable package indexes.'
 Assert-True ($setupText.Contains('--require-hashes')) 'Locked setup must require dependency hashes.'
@@ -205,6 +213,14 @@ foreach ($archiveField in @(
 }
 
 $runnerText = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'invoke-model-training.ps1') -Raw
+foreach ($runtimeProbeScript in @(
+  [pscustomobject]@{ Name = 'setup-model-environment.ps1'; Text = $setupText }
+  [pscustomobject]@{ Name = 'new-model-training-lock.ps1'; Text = $lockText }
+  [pscustomobject]@{ Name = 'invoke-model-training.ps1'; Text = $runnerText }
+)) {
+  Assert-True (-not $runtimeProbeScript.Text.Contains('$pythonPath -c')) `
+    "$($runtimeProbeScript.Name) must not pass inline Python through native -c arguments."
+}
 Assert-True ($runnerText.Contains('prepare-archives')) `
   'The final runner must use the network-free streamed archive command.'
 Assert-True (-not $runnerText.Contains('--base-url')) `

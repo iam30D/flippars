@@ -245,6 +245,56 @@ function Get-Utf8TextSha256 {
   }
 }
 
+function Get-PythonRuntimeCompatibility {
+  [CmdletBinding()]
+  param([Parameter(Mandatory)][string]$PythonPath)
+
+  # Keep this probe ASCII-only and send it over stdin. Windows PowerShell can
+  # strip embedded quotes when serializing native executable arguments.
+  $probe = @'
+import json
+import platform
+import sys
+import sysconfig
+
+payload = {
+    "implementation": platform.python_implementation(),
+    "version": platform.python_version(),
+    "cacheTag": sys.implementation.cache_tag,
+    "platform": sysconfig.get_platform(),
+    "machine": platform.machine(),
+}
+print(json.dumps(payload, separators=(",", ":")))
+'@
+  $output = @($probe | & $PythonPath -)
+  if ($LASTEXITCODE -ne 0) {
+    throw 'Unable to inspect Python runtime compatibility.'
+  }
+  $json = $output -join [Environment]::NewLine
+  try {
+    $compatibility = $json | ConvertFrom-Json -ErrorAction Stop
+  } catch {
+    throw 'Python runtime compatibility output is not valid JSON.'
+  }
+
+  $expectedFields = @('implementation', 'version', 'cacheTag', 'platform', 'machine')
+  $properties = @($compatibility.PSObject.Properties)
+  if ($properties.Count -ne $expectedFields.Count) {
+    throw 'Python runtime compatibility must contain exactly five fields.'
+  }
+  for ($index = 0; $index -lt $expectedFields.Count; $index += 1) {
+    $property = $properties[$index]
+    if ($property.Name -cne $expectedFields[$index]) {
+      throw 'Python runtime compatibility fields are missing, reordered, or unexpected.'
+    }
+    if (($property.Value -isnot [string]) -or
+        [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+      throw "Python runtime compatibility field '$($property.Name)' must be a nonempty string."
+    }
+  }
+  return $compatibility
+}
+
 function Assert-BinanceDataVisionUri {
   [CmdletBinding()]
   param([Parameter(Mandatory)][uri]$Uri)

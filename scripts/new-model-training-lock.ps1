@@ -183,12 +183,11 @@ $inventory = [ordered]@{
 }
 Write-JsonEvidenceAtomic -Path $inventoryPath -Value $inventory -Depth 12
 
+$runtime = Get-PythonRuntimeCompatibility $pythonPath
+
 Move-Item -LiteralPath $stagingWheelhouse -Destination $wheelhousePath
 Move-Item -LiteralPath $stagingLockPath -Destination $lockPath
 
-$runtimeJson = & $pythonPath -c 'import json,platform,sys,sysconfig; print(json.dumps({"implementation": platform.python_implementation(), "version": platform.python_version(), "cacheTag": sys.implementation.cache_tag, "platform": sysconfig.get_platform(), "machine": platform.machine()}))'
-if ($LASTEXITCODE -ne 0) { throw 'Unable to capture semantic-lock Python compatibility.' }
-$runtime = ($runtimeJson -join [Environment]::NewLine) | ConvertFrom-Json
 $wheelBindings = @($licenseRecords | Sort-Object name | ForEach-Object {
   [ordered]@{
     name = [string]$_.name
