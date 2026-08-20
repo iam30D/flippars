@@ -1,93 +1,104 @@
-# Flippars market-data collector and draft training
+# Flippars Binance Spot draft training
 
-This package is a repository-side implementation of the offline training
-workflow. The Python environment, raw exchange data, and model artifacts must
-remain outside Git. The collector uses Binance Data Vision's documented daily
-archive paths and download endpoint; it does not use trading credentials or
-place orders.
+This package implements the offline research path for Binance Spot `BTCUSDT`.
+It consumes public daily trade archives and can produce only immutable
+`flippars.multinomial-candidate/3` `DRAFT` artifacts. It never accepts exchange
+credentials, places trades, approves a model, enables signals, or promotes an
+artifact.
 
-**Publication boundary:** the source code may be committed only after explicit
-owner approval. Provider permits must be recorded before production release.
-Raw data, contracts, credentials, and generated artifacts remain outside Git.
+Keep Python environments, raw archives, prepared JSONL, dependency wheels,
+evidence, evaluations, and model artifacts in `C:\Users\HP\Flippars-ml` (or
+another reviewed workspace outside this repository). Do not commit generated
+training material.
 
-The setup installs model libraries, not a pre-trained Bitcoin checkpoint:
+## Governed operator path
 
-- [LightGBM official source and MIT license](https://github.com/lightgbm-org/LightGBM)
-- [LightGBM Python package](https://pypi.org/project/lightgbm/)
-- [XGBoost official source and Apache-2.0 license](https://github.com/dmlc/xgboost)
-- [XGBoost Python package](https://pypi.org/project/xgboost/)
+Use [the offline model-training runbook](../../docs/runbooks/offline-model-training.md).
+It provides two paste-once PowerShell blocks:
 
-## Setup on Windows
+1. Build a public-PyPI bootstrap environment, create a profile/platform-bound
+   semantic wheel lock, install the final environment with `--no-index` and
+   `--require-hashes`, and materialize an exact checksum-verified Binance date
+   window while online.
+2. Revalidate all evidence and run network-free preparation/training from a
+   clean reviewed commit.
 
-From the repository root:
+The final runner calls `prepare-archives` and `train` separately. It never calls
+the download-capable `collect` or `all` command.
 
-```powershell
-Set-Location C:\Users\<you>\Downloads\Flippars
-.\scripts\setup-model-environment.ps1
-```
+## CLI boundaries
 
-The default training workspace is `C:\Users\<you>\Flippars-ml`. Use
-`-TrainingRoot` to select another directory. The script prefers Python 3.11
-and automatically falls back to an installed Python 3.12–3.14 runtime.
+- `collect` downloads only public daily Binance Spot trade archives and their
+  adjacent `.CHECKSUM` files from HTTPS `data.binance.vision`; requested and
+  final response URIs must remain on that host.
+- `prepare-archives` is network-free. It requires an exact continuous archive
+  root, verifies every archive against its adjacent SHA-256 sidecar, streams one
+  daily archive at a time, and writes point-in-time signal-specific rows
+  atomically. It may claim `PUBLIC_BINANCE_ARCHIVE` lineage only when a strict
+  schema-3 acquisition manifest proves fresh HTTPS checksum transport for every
+  selected day; otherwise archive replay is labeled `LOCAL_ARCHIVE_REPLAY`.
+- `prepare` is a compatibility path for already normalized local archive
+  replay. It preserves source checksums, trade IDs, and microsecond event times
+  but cannot claim official transport evidence.
+- `train` is network-free. It validates the complete canonical JSONL bytes
+  twice and requires identical content/count/range audits across both passes,
+  partitions unique windows chronologically, selects deterministic bounded
+  complete-window samples, fits a fail-closed full-objective
+  multinomial-logistic baseline, calibrates it with equal window weight, freezes
+  baseline/threshold policy before computing or inspecting holdout outcome
+  statistics or metrics, replays first-qualified
+  alerts with OOD/data-health abstention, and writes a strict V3 draft plus
+  diagnostic evaluation.
+- `all` exists for bounded exploration only because it includes acquisition. It
+  is forbidden in `FrozenDraft` operations.
+- `smoke` creates only synthetic local data for an end-to-end diagnostic.
 
-## Collect and train in one command
+The V3 target has three outcomes: `ABOVE_OPEN`, `BELOW_OPEN`, and `AT_OPEN`.
+Feature rows use 24 ordered finite features, 13 contiguous completed lookback
+windows, and only trades with `eventTime < decisionAt`. Five-minute reversal,
+five-minute early-direction, and fifteen-minute reversal use their exact
+governed 15-second schedules and retain flat/deadband outcomes.
+Deadband comparisons use decimal arithmetic, so equality at exactly plus or
+minus five basis points remains `AT_OPEN`.
 
-Use an explicitly permitted date range. The end date is exclusive:
+## Model and evaluation status
 
-```powershell
-$python = "$env:USERPROFILE\Flippars-ml\.venv\Scripts\python.exe"
-& $python -m flippars_model_training all `
-  --symbol BTCUSDT `
-  --start 2025-01-01 `
-  --end 2025-02-01 `
-  --raw-root "$env:USERPROFILE\Flippars-ml\data\raw" `
-  --prepared-output "$env:USERPROFILE\Flippars-ml\data\processed\btc-5m.jsonl" `
-  --artifact-output "$env:USERPROFILE\Flippars-ml\artifacts\draft\candidate-five-minute-2025.01.json" `
-  --evaluation-output "$env:USERPROFILE\Flippars-ml\artifacts\draft\candidate-five-minute-2025.01.evaluation.json" `
-  --signal-type FIVE_MINUTE_EARLY_DIRECTION `
-  --version 2025.01.1 `
-  --max-files 31
-```
+The multinomial logistic model is a governed, portable baseline, not evidence
+that it is the best possible BTC model. The full corpus is integrity-checked,
+but fit/calibration/holdout matrices use deterministic complete-window samples
+to bound RAM and runtime. Evaluation records population and sample counts,
+selection digest, class-window support, calibration-selected baseline,
+window-balanced metrics, and seven-day moving-block intervals over a continuous
+UTC calendar with explicit missing-day counts. It reports raw scheduled,
+in-distribution, direction-eligible, and
+first-emitted populations separately. Because historical data cannot prove the
+live cross-venue quorum, production-guarded replay abstains; a separately
+labeled Binance-conditional replay remains diagnostic only.
 
-The command downloads daily ZIP files from:
+The artifact binds a versioned pre-evaluation policy digest. Policy V2 uses
+canonical decimal strings, recursively sorted ASCII JSON, and exact JSON
+preimages for the target, fitted state, and sampling projection. The
+TypeScript verifier hashes those preimages and independently rebinds them to
+the artifact and evaluation; matching copied digest strings are insufficient.
+Global temperature scaling is not fitted on first-emitted alerts, so the draft
+does not claim calibrated user-facing confidence for that population. The
+optimizer must converge with finite parameters and a decreasing stable
+log-sum-exp objective. It accepts either the strict gradient criterion or the
+preregistered sustained plateau with a bounded infinity-norm gradient;
+line-search failure, objective increase, non-finite state, or epoch-budget
+exhaustion prevents artifact creation.
 
-`https://data.binance.vision/?prefix=data/spot/daily/trades/BTCUSDT/`
+`requirements.txt` contains only baseline dependencies. Optional LightGBM and
+XGBoost exploration uses `requirements-challengers.txt` and a separate
+`ChallengerExploration` environment. Challenger output cannot enter the current
+artifact/runtime contract without a versioned serving implementation,
+independent validation, and governance approval.
 
-It then normalizes trades, builds five-minute candle features, trains a
-three-class multinomial-logistic baseline, calibrates it, evaluates the
-untouched chronological holdout, and writes a `DRAFT` artifact.
+The model-artifact verifier deliberately rejects the V3 candidate/manifest pair
+as offline-only. Live Binance trade feature parity, receive-time health,
+cross-venue quorum history, prospective shadow evidence, drift monitoring,
+independent approval, registration, canary, rollback, and user-comprehension
+gates remain required before public alerts can be considered.
 
-LightGBM and XGBoost are installed for challenger experiments. The current
-Flippars artifact contract and runtime accept the multinomial-logistic draft;
-those tree models are not silently promoted or used for production until a
-versioned runtime contract is added and independently reviewed.
-
-## Separate commands
-
-```powershell
-& $python -m flippars_model_training collect `
-  --symbol BTCUSDT --start 2025-01-01 --end 2025-01-02 `
-  --raw-root "$env:USERPROFILE\Flippars-ml\data\raw"
-
-& $python -m flippars_model_training prepare `
-  --normalized-root "$env:USERPROFILE\Flippars-ml\data\raw\normalized" `
-  --output "$env:USERPROFILE\Flippars-ml\data\processed\btc-5m.jsonl" `
-  --signal-type FIVE_MINUTE_EARLY_DIRECTION
-
-& $python -m flippars_model_training train `
-  --input "$env:USERPROFILE\Flippars-ml\data\processed\btc-5m.jsonl" `
-  --output "$env:USERPROFILE\Flippars-ml\artifacts\draft\candidate.json" `
-  --evaluation-output "$env:USERPROFILE\Flippars-ml\artifacts\draft\evaluation.json" `
-  --signal-type FIVE_MINUTE_EARLY_DIRECTION --version 2025.01.1
-```
-
-The generated candidate is intentionally not approved, registered, or
-production-ready. The first feature/label builder is a conservative baseline
-using the previous completed candle to predict the next candle's close
-relation. Signal-specific production semantics, live risk features, shadow
-recording, independent approval, and the production runtime remain required.
-
-Do not put raw data, provider contracts, credentials, model artifacts, or
-approval keys in this repository. A model must pass the governance process in
-`docs/model-governance.md` before guest notifications are enabled in
-production.
+Publication of this source still requires explicit owner approval. Provider
+permits and redistribution decisions must be recorded before production use.

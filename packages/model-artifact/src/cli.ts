@@ -4,7 +4,10 @@ import { join, resolve } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { ModelBundleManifestSchema, type ApprovalEvidenceName } from "./schema.js";
+import {
+  GovernedModelBundleManifestSchema,
+  type ApprovalEvidenceName,
+} from "./schema.js";
 import { parseJsonDocument, verifyModelBundle } from "./verifier.js";
 
 const MANIFEST_MAX_BYTES = 256 * 1_024;
@@ -46,7 +49,7 @@ export async function runCli(values: readonly string[]): Promise<number> {
       "manifest.json",
       MANIFEST_MAX_BYTES,
     );
-    const manifest = ModelBundleManifestSchema.parse(
+    const manifest = GovernedModelBundleManifestSchema.parse(
       parseJsonDocument(manifestBytes, "manifest.json"),
     );
     const artifactBytes = await readBundleFile(

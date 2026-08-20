@@ -27,6 +27,7 @@
     "verify:bundle": "npm run build && node dist/cli.js"
   },
   "dependencies": {
+    "@flippars/contracts": "0.1.0",
     "zod": "^3.24.2"
   },
   "devDependencies": {

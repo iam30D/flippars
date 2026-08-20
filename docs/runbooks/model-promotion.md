@@ -52,9 +52,14 @@ Before constructing an approval bundle for a signal type:
    canary period. Recalibrating changes the governed artifact and requires a new
    manifest and appropriate revalidation.
 
-The repository does not yet implement the live prospective shadow recorder or
-the v2 three-class training/runtime pipeline. Until those arrive and their
-evidence is independently accepted, this prerequisite list cannot pass.
+The repository now contains an offline Binance-trade training path and additive
+V3 three-class candidate/manifest contracts. Those pieces produce and validate
+draft research material only. The live causal feature/risk provider, Binance
+trade-based outcome evaluator, prospective shadow recorder, governed registrar,
+and runtime migration do not exist. Until those components arrive and their
+evidence is independently accepted, this prerequisite list cannot pass. V2
+remains parseable for historical dry-run compatibility and is not target-parity
+evidence for V3.
 
 ## Bundle and keyring
 

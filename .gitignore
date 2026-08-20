@@ -6,6 +6,16 @@ web-build/
 .expo/
 .turbo/
 
+# Python environments, caches, and generated package metadata
+.venv/
+.venv-*/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
 # Local configuration and secrets
 .env
 .env.*

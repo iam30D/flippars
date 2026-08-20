@@ -4,19 +4,271 @@ import type { ZodError } from "zod";
 
 import {
   APPROVAL_ROLES,
-  DraftMultinomialArtifactSchema,
-  ModelBundleManifestSchema,
+  DraftModelArtifactSchema,
+  GovernedModelBundleManifestSchema,
   SignedApprovalSetSchema,
   TrustedModelKeyringSchema,
   type ApprovalEvidenceName,
   type ApprovalRole,
   type DraftMultinomialArtifact,
+  type DraftModelArtifact,
+  type GovernedModelBundleManifest,
   type ModelBundleManifest,
 } from "./schema.js";
 import { sha256Hex, verifyEd25519ApprovalSignature } from "./crypto.js";
 
 const DAY_MS = 86_400_000;
 const ALLOWED_FUTURE_CLOCK_SKEW_MS = 5 * 60_000;
+const MAX_JSON_DOCUMENT_BYTES = 64 * 1_024 * 1_024;
+const MAX_JSON_DOCUMENT_DEPTH = 128;
+
+class JsonIntegrityScanner {
+  private offset = 0;
+
+  public constructor(
+    private readonly text: string,
+    private readonly label: string,
+  ) {}
+
+  public validate(): void {
+    this.skipWhitespace();
+    if (this.offset === this.text.length) {
+      this.fail("must contain a JSON value");
+    }
+    this.parseValue(0);
+    this.skipWhitespace();
+    if (this.offset !== this.text.length) {
+      this.fail("contains trailing content");
+    }
+  }
+
+  private parseValue(depth: number): void {
+    if (depth > MAX_JSON_DOCUMENT_DEPTH) {
+      this.fail(`exceeds the maximum nesting depth of ${MAX_JSON_DOCUMENT_DEPTH}`);
+    }
+
+    const character = this.text[this.offset];
+    if (character === "{") {
+      this.parseObject(depth);
+    } else if (character === "[") {
+      this.parseArray(depth);
+    } else if (character === '"') {
+      this.parseString(false);
+    } else if (character === "t") {
+      this.parseLiteral("true");
+    } else if (character === "f") {
+      this.parseLiteral("false");
+    } else if (character === "n") {
+      this.parseLiteral("null");
+    } else if (character === "-" || this.isDigit(character)) {
+      this.parseNumber();
+    } else {
+      this.fail("contains an invalid JSON value");
+    }
+  }
+
+  private parseObject(depth: number): void {
+    this.offset += 1;
+    this.skipWhitespace();
+    if (this.text[this.offset] === "}") {
+      this.offset += 1;
+      return;
+    }
+
+    const keys = new Set<string>();
+    while (true) {
+      if (this.text[this.offset] !== '"') {
+        this.fail("contains a non-string object key");
+      }
+      const key = this.parseString(true);
+      if (keys.has(key)) {
+        this.fail(`contains duplicate object key ${JSON.stringify(key)}`);
+      }
+      keys.add(key);
+
+      this.skipWhitespace();
+      this.expect(":");
+      this.skipWhitespace();
+      this.parseValue(depth + 1);
+      this.skipWhitespace();
+
+      const separator = this.text[this.offset];
+      if (separator === "}") {
+        this.offset += 1;
+        return;
+      }
+      if (separator !== ",") {
+        this.fail("contains an invalid object separator");
+      }
+      this.offset += 1;
+      this.skipWhitespace();
+    }
+  }
+
+  private parseArray(depth: number): void {
+    this.offset += 1;
+    this.skipWhitespace();
+    if (this.text[this.offset] === "]") {
+      this.offset += 1;
+      return;
+    }
+
+    while (true) {
+      this.parseValue(depth + 1);
+      this.skipWhitespace();
+      const separator = this.text[this.offset];
+      if (separator === "]") {
+        this.offset += 1;
+        return;
+      }
+      if (separator !== ",") {
+        this.fail("contains an invalid array separator");
+      }
+      this.offset += 1;
+      this.skipWhitespace();
+    }
+  }
+
+  private parseString(decode: false): undefined;
+  private parseString(decode: true): string;
+  private parseString(decode: boolean): string | undefined {
+    const start = this.offset;
+    this.offset += 1;
+    while (this.offset < this.text.length) {
+      const character = this.text[this.offset]!;
+      if (character === '"') {
+        this.offset += 1;
+        if (!decode) return undefined;
+        try {
+          return JSON.parse(this.text.slice(start, this.offset)) as string;
+        } catch {
+          this.fail("contains an invalid object key");
+        }
+      }
+      if (character.charCodeAt(0) < 0x20) {
+        this.fail("contains an unescaped control character");
+      }
+      if (character !== "\\") {
+        this.offset += 1;
+        continue;
+      }
+
+      const escape = this.text[this.offset + 1];
+      if (
+        escape === '"' ||
+        escape === "\\" ||
+        escape === "/" ||
+        escape === "b" ||
+        escape === "f" ||
+        escape === "n" ||
+        escape === "r" ||
+        escape === "t"
+      ) {
+        this.offset += 2;
+        continue;
+      }
+      if (escape !== "u") {
+        this.fail("contains an invalid JSON escape");
+      }
+      for (let index = this.offset + 2; index < this.offset + 6; index += 1) {
+        const codeUnit = this.text.charCodeAt(index);
+        const hexadecimal =
+          (codeUnit >= 0x30 && codeUnit <= 0x39) ||
+          (codeUnit >= 0x41 && codeUnit <= 0x46) ||
+          (codeUnit >= 0x61 && codeUnit <= 0x66);
+        if (!hexadecimal) {
+          this.fail("contains an invalid Unicode escape");
+        }
+      }
+      this.offset += 6;
+    }
+
+    this.fail("contains an unterminated JSON string");
+  }
+
+  private parseNumber(): void {
+    const start = this.offset;
+    if (this.text[this.offset] === "-") {
+      this.offset += 1;
+    }
+
+    const firstDigit = this.text[this.offset];
+    if (firstDigit === "0") {
+      this.offset += 1;
+    } else if (firstDigit !== undefined && firstDigit >= "1" && firstDigit <= "9") {
+      this.offset += 1;
+      while (this.isDigit(this.text[this.offset])) this.offset += 1;
+    } else {
+      this.fail("contains an invalid JSON number");
+    }
+
+    if (this.text[this.offset] === ".") {
+      this.offset += 1;
+      if (!this.isDigit(this.text[this.offset])) {
+        this.fail("contains an invalid JSON number");
+      }
+      while (this.isDigit(this.text[this.offset])) this.offset += 1;
+    }
+
+    const exponent = this.text[this.offset];
+    if (exponent === "e" || exponent === "E") {
+      this.offset += 1;
+      const sign = this.text[this.offset];
+      if (sign === "+" || sign === "-") this.offset += 1;
+      if (!this.isDigit(this.text[this.offset])) {
+        this.fail("contains an invalid JSON number");
+      }
+      while (this.isDigit(this.text[this.offset])) this.offset += 1;
+    }
+
+    const numeric = Number(this.text.slice(start, this.offset));
+    if (!Number.isFinite(numeric)) {
+      this.fail("contains a non-finite JSON number");
+    }
+    if (Number.isInteger(numeric) && !Number.isSafeInteger(numeric)) {
+      this.fail("contains an integer outside the JavaScript safe-integer range");
+    }
+  }
+
+  private parseLiteral(literal: "false" | "null" | "true"): void {
+    if (!this.text.startsWith(literal, this.offset)) {
+      this.fail("contains an invalid JSON literal");
+    }
+    this.offset += literal.length;
+  }
+
+  private skipWhitespace(): void {
+    while (true) {
+      const codeUnit = this.text.charCodeAt(this.offset);
+      if (
+        codeUnit !== 0x20 &&
+        codeUnit !== 0x09 &&
+        codeUnit !== 0x0a &&
+        codeUnit !== 0x0d
+      ) {
+        return;
+      }
+      this.offset += 1;
+    }
+  }
+
+  private isDigit(character: string | undefined): boolean {
+    return character !== undefined && character >= "0" && character <= "9";
+  }
+
+  private expect(expected: string): void {
+    if (this.text[this.offset] !== expected) {
+      this.fail(`must contain ${JSON.stringify(expected)} at this position`);
+    }
+    this.offset += 1;
+  }
+
+  private fail(message: string): never {
+    throw new TypeError(
+      `${this.label} is not valid JSON: ${message} at offset ${this.offset}`,
+    );
+  }
+}
 
 export const PROVISIONAL_GATE_POLICY = Object.freeze({
   minimumBrierSkillFraction: 0.05,
@@ -54,19 +306,25 @@ export interface RejectedModelBundle {
 }
 
 export type ModelBundleVerification = VerifiedModelBundle | RejectedModelBundle;
+export const isOfflineOnlyCandidatePair = (
+  artifact: string,
+  manifest: string,
+): boolean =>
+  artifact === "flippars.multinomial-candidate/3" &&
+  manifest === "flippars.model-bundle-manifest/2";
 
 export function parseJsonDocument(bytes: Uint8Array, label: string): unknown {
+  if (bytes.byteLength > MAX_JSON_DOCUMENT_BYTES) {
+    throw new TypeError(`${label} exceeds the maximum JSON document size`);
+  }
   let text: string;
   try {
     text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch {
     throw new TypeError(`${label} is not valid UTF-8`);
   }
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    throw new TypeError(`${label} is not valid JSON`);
-  }
+  new JsonIntegrityScanner(text, label).validate();
+  return JSON.parse(text) as unknown;
 }
 
 export function verifyModelBundle(
@@ -77,8 +335,8 @@ export function verifyModelBundle(
 
   const manifestJson = parseBytes(input.manifestBytes, "manifest.json", issues);
   const artifactJson = parseBytes(input.artifactBytes, "artifact", issues);
-  const manifestResult = ModelBundleManifestSchema.safeParse(manifestJson);
-  const artifactResult = DraftMultinomialArtifactSchema.safeParse(artifactJson);
+  const manifestResult = GovernedModelBundleManifestSchema.safeParse(manifestJson);
+  const artifactResult = DraftModelArtifactSchema.safeParse(artifactJson);
   const approvalResult = SignedApprovalSetSchema.safeParse(input.approvalSet);
   const keyringResult = TrustedModelKeyringSchema.safeParse(input.trustedKeyring);
 
@@ -117,6 +375,9 @@ export function verifyModelBundle(
     artifactSha256,
     issues,
   );
+  if (isOfflineOnlyCandidatePair(artifact.schemaVersion, manifest.schemaVersion)) {
+    issues.push("v3 Binance candidates are offline-only and cannot be promoted");
+  }
   verifyEvidence(manifest, input.evidenceBytes, issues);
   verifyGovernanceGates(manifest, artifact, verifiedAtMs, issues);
 
@@ -240,6 +501,12 @@ export function verifyModelBundle(
   }
 
   if (issues.length > 0) return rejected(issues);
+  if (
+    manifest.schemaVersion !== "flippars.model-bundle-manifest/1" ||
+    artifact.schemaVersion !== "flippars.multinomial-candidate/2"
+  ) {
+    return rejected(["only the governed v1/v2 bundle pair can be verified"]);
+  }
   return {
     ok: true,
     manifest,
@@ -252,8 +519,8 @@ export function verifyModelBundle(
 }
 
 function verifyArtifactReference(
-  manifest: ModelBundleManifest,
-  artifact: DraftMultinomialArtifact,
+  manifest: GovernedModelBundleManifest,
+  artifact: DraftModelArtifact,
   byteLength: number,
   digest: string,
   issues: string[],
@@ -272,17 +539,66 @@ function verifyArtifactReference(
     issues.push("draft artifact identity does not match the manifest");
   }
   if (
-    artifact.target.kind !== manifest.target.kind ||
-    artifact.target.deadbandBps !== manifest.target.deadbandBps ||
-    artifact.target.labelPolicyVersion !== manifest.target.labelPolicyVersion ||
-    artifact.target.classOrder.some(
-      (relation, index) => relation !== manifest.target.classOrder[index],
-    )
+    artifact.schemaVersion === "flippars.multinomial-candidate/2" &&
+    manifest.schemaVersion === "flippars.model-bundle-manifest/1"
   ) {
-    issues.push("draft artifact target does not match the manifest");
-  }
-  if (artifact.featureSchemaVersion !== manifest.runtime.featureSchemaVersion) {
-    issues.push("feature schema version does not match the manifest");
+    if (
+      artifact.target.kind !== manifest.target.kind ||
+      artifact.target.deadbandBps !== manifest.target.deadbandBps ||
+      artifact.target.labelPolicyVersion !== manifest.target.labelPolicyVersion ||
+      artifact.target.classOrder.some(
+        (relation, index) => relation !== manifest.target.classOrder[index],
+      )
+    ) {
+      issues.push("draft artifact target does not match the manifest");
+    }
+    if (artifact.featureSchemaVersion !== manifest.runtime.featureSchemaVersion) {
+      issues.push("feature schema version does not match the manifest");
+    }
+  } else if (
+    artifact.schemaVersion === "flippars.multinomial-candidate/3" &&
+    manifest.schemaVersion === "flippars.model-bundle-manifest/2"
+  ) {
+    if (JSON.stringify(artifact.target) !== JSON.stringify(manifest.target)) {
+      issues.push("draft artifact target does not match the manifest");
+    }
+    if (
+      artifact.featureSchemaVersion !==
+      manifest.runtime.compatibility.featureSchemaVersion
+    ) {
+      issues.push("feature schema version does not match the manifest");
+    }
+    if (artifact.target.deadbandBps !== manifest.runtime.compatibility.deadbandBps) {
+      issues.push("artifact deadband does not match runtime compatibility metadata");
+    }
+    if (
+      JSON.stringify(artifact.target.candidateSchedule) !==
+      JSON.stringify(manifest.runtime.compatibility.candidateSchedule)
+    ) {
+      issues.push("artifact candidate schedule does not match runtime metadata");
+    }
+    if (artifact.ood.version !== manifest.runtime.compatibility.oodVersion) {
+      issues.push("artifact OOD support version does not match runtime metadata");
+    }
+    if (
+      artifact.datasetContentSha256 !== manifest.datasetContentSha256 ||
+      artifact.datasetManifestSha256 !== manifest.datasetManifestSha256
+    ) {
+      issues.push("dataset content or manifest digest does not match the manifest");
+    }
+    if (
+      artifact.datasetManifest.lineageKind !== "PUBLIC_BINANCE_ARCHIVE" ||
+      !artifact.datasetManifest.archiveChecksumsVerified ||
+      !artifact.datasetManifest.officialTransportEvidenceVerified ||
+      artifact.datasetManifest.acquisitionArchiveIndexSha256 === null ||
+      artifact.datasetManifest.acquisitionManifestSha256 === null
+    ) {
+      issues.push(
+        "dataset lacks public Binance lineage with fresh official checksum transport evidence",
+      );
+    }
+  } else {
+    issues.push("artifact and manifest schema versions are incompatible");
   }
   if (
     artifact.calibration.version !== manifest.runtime.calibrationVersion ||
@@ -290,18 +606,25 @@ function verifyArtifactReference(
   ) {
     issues.push("calibration identity or validity does not match the manifest");
   }
-  if (artifact.datasetSha256 !== manifest.datasetSha256) {
+  if (
+    artifact.schemaVersion === "flippars.multinomial-candidate/2" &&
+    manifest.schemaVersion === "flippars.model-bundle-manifest/1" &&
+    artifact.datasetSha256 !== manifest.datasetSha256
+  ) {
     issues.push("dataset digest does not match the manifest");
   }
 }
 
 function verifyEvidence(
-  manifest: ModelBundleManifest,
+  manifest: GovernedModelBundleManifest,
   supplied: Readonly<Partial<Record<ApprovalEvidenceName, Uint8Array>>>,
   issues: string[],
 ): void {
   for (const [name, reference] of Object.entries(manifest.evidence) as Array<
-    [ApprovalEvidenceName, ModelBundleManifest["evidence"][ApprovalEvidenceName]]
+    [
+      ApprovalEvidenceName,
+      GovernedModelBundleManifest["evidence"][ApprovalEvidenceName],
+    ]
   >) {
     if (reference === null) continue;
     const bytes = supplied[name];
@@ -324,8 +647,8 @@ function verifyEvidence(
 }
 
 function verifyGovernanceGates(
-  manifest: ModelBundleManifest,
-  artifact: DraftMultinomialArtifact,
+  manifest: GovernedModelBundleManifest,
+  artifact: DraftModelArtifact,
   verifiedAtMs: number,
   issues: string[],
 ): void {
