@@ -26,6 +26,14 @@ It provides two paste-once PowerShell blocks:
 The final runner calls `prepare-archives` and `train` separately. It never calls
 the download-capable `collect` or `all` command.
 
+`scripts/invoke-model-training.ps1 -Resume` is an explicit same-version
+recovery path, not an overwrite switch. It accepts only a strictly classified
+incomplete archive-preparation state or a complete prepared dataset pair with
+no artifact output. Archive preparation continues after the last validated
+daily checkpoint; fitting always restarts from epoch zero. Ambiguous files,
+changed inputs, partial artifacts, or completed evidence fail closed and must
+be preserved under their original version.
+
 ## CLI boundaries
 
 - `collect` downloads only public daily Binance Spot trade archives and their
@@ -37,6 +45,13 @@ the download-capable `collect` or `all` command.
   atomically. It may claim `PUBLIC_BINANCE_ARCHIVE` lineage only when a strict
   schema-3 acquisition manifest proves fresh HTTPS checksum transport for every
   selected day; otherwise archive replay is labeled `LOCAL_ARCHIVE_REPLAY`.
+  Each completed day is retained in a plan-bound, hash-chained checkpoint. A
+  resumed run validates every canonical checkpoint chunk and replays the final
+  dataset through the same writer, preserving uninterrupted JSONL bytes and
+  manifest semantics. Checkpoints remain available through fitting, evaluation,
+  and cross-runtime verification. The runner attempts to remove them only after
+  the `COMPLETE` run manifest is durably published, so interrupted cleanup cannot
+  destroy an otherwise resumable run.
 - `prepare` is a compatibility path for already normalized local archive
   replay. It preserves source checksums, trade IDs, and microsecond event times
   but cannot claim official transport evidence.
@@ -99,6 +114,12 @@ as offline-only. Live Binance trade feature parity, receive-time health,
 cross-venue quorum history, prospective shadow evidence, drift monitoring,
 independent approval, registration, canary, rollback, and user-comprehension
 gates remain required before public alerts can be considered.
+
+Checkpoint digests detect ordinary corruption but are not signatures. The
+external training workspace must be protected from untrusted local writers; an
+attacker who can rewrite every checkpoint and recompute its unkeyed digest chain
+is outside the checkpoint trust model. Provider evidence, final artifacts, and
+promotion still require their separate governance controls.
 
 Publication of this source still requires explicit owner approval. Provider
 permits and redistribution decisions must be recorded before production use.

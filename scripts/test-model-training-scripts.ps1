@@ -227,13 +227,55 @@ Assert-True (-not $runnerText.Contains('--base-url')) `
   'The final runner must not accept or pass any acquisition URL.'
 Assert-True (-not $runnerText.Contains('flippars_model_training all')) `
   'The final runner must not invoke the collection-capable all command.'
-Assert-True ($runnerText.Contains('Tee-Object -FilePath $cliOutputPath')) `
-  'The final runner must stream Python output instead of buffering it.'
+Assert-True ($runnerText.Contains('Invoke-LoggedNativeProcess')) `
+  'The final runner must use the durable live native-process logger.'
+Assert-True (-not $runnerText.Contains('2>&1 |')) `
+  'The final runner must not convert native stderr into PowerShell error records.'
+Assert-True ($runnerText.Contains('[switch]$Resume')) `
+  'The final runner must expose only an explicit same-version resume switch.'
+Assert-True ($runnerText.Contains("Kind = 'ArchivePreparation'")) `
+  'The runner must distinguish a resumable archive-checkpoint state.'
+Assert-True ($runnerText.Contains("Kind = 'PreparedDataset'")) `
+  'The runner must distinguish a reusable prepared-dataset state.'
+Assert-True ($runnerText.Contains("'.prepared.jsonl.archive-checkpoints'")) `
+  'The runner must bind Python automatic checkpoints to the exact hidden store.'
+Assert-True ($runnerText.Contains('-Append:$runStartState.AppendFirstChild')) `
+  'The first resumed child must append to the existing command log.'
+Assert-True ($runnerText.Contains('Write-ModelTrainingResumeSessionMarker')) `
+  'Every resumed execution must write a durable visible session boundary.'
+Assert-True (-not $runnerText.Contains(
+    'Completed preparation left an unexpected archive checkpoint store.'
+  )) 'Validated checkpoints must remain available through fitting and evaluation.'
+$runManifestPublishIndex = $runnerText.IndexOf(
+  'Write-JsonEvidenceAtomic -Path $runManifestPath'
+)
+$checkpointCleanupIndex = $runnerText.IndexOf(
+  '[void](Remove-CompletedArchiveCheckpointStore'
+)
+Assert-True ($runManifestPublishIndex -ge 0 -and
+    $checkpointCleanupIndex -gt $runManifestPublishIndex) `
+  'Checkpoint cleanup must occur only after the COMPLETE run manifest is durable.'
+Assert-True ($runnerText.Contains(
+    'Checkpoint cleanup target is not the exact governed checkpoint child.'
+  )) 'Checkpoint cleanup must refuse any target except the exact governed child.'
+Assert-True ($runnerText.Contains(
+    'Checkpoint cleanup refuses a store containing a reparse point.'
+  )) 'Checkpoint cleanup must reject nested reparse points before recursive removal.'
+Assert-True ($runnerText.Contains(
+    'The COMPLETE run manifest is durable, but checkpoint cleanup was not completed:'
+  )) 'Post-completion checkpoint cleanup failures must be warning-only.'
+Assert-True ($runnerText.Contains('$preparedManifest.target.signalType -ne $SignalType')) `
+  'Prepared-pair resume must validate the exact signal identity before fitting.'
+Assert-True ($guardrailsText.Contains('ReadLineAsync()')) `
+  'The native-process logger must drain stdout and stderr concurrently.'
+Assert-True ($guardrailsText.Contains('[flippars-native-exit] exitCode={0}')) `
+  'The native-process logger must persist a deterministic nonzero exit footer.'
 Assert-True ($runnerText.Contains("dependencyProfile -ne 'GovernedBaseline'")) `
   'FrozenDraft must reject non-baseline dependency profiles.'
 Assert-True ($runnerText.Contains('acquisitionManifest.schemaVersion -ne 3')) `
   'FrozenDraft must require schema-3 acquisition evidence.'
-Assert-True ($runnerText.Contains('--acquisition-manifest $acquisitionManifestPath')) `
+Assert-True ($runnerText.Contains("'--acquisition-manifest'") -and
+    $runnerText.Contains('$acquisitionManifestPath')) `
   'Preparation and cross-runtime verification must receive the acquisition manifest.'
 Assert-True ($runnerText.Contains('$preparedArchive.day -ne $acquiredArchive.day')) `
   'Prepared archive comparison must use the canonical acquisition day field.'
@@ -323,48 +365,535 @@ Assert-True ($runbookText.Contains('npm run build --workspace @flippars/contract
 Assert-True ($runbookText.Contains('npm run build --workspace @flippars/model-artifact')) `
   'Offline training must build the artifact schema before model runs.'
 
-$nativeExitLog = Join-Path ([System.IO.Path]::GetTempPath()) `
-  "Flippars-native-exit-$([guid]::NewGuid().ToString('N')).log"
-$nativeFailure = $null
+$runnerTokens = $null
+$runnerParseErrors = $null
+$runnerAst = [System.Management.Automation.Language.Parser]::ParseFile(
+  (Join-Path $PSScriptRoot 'invoke-model-training.ps1'),
+  [ref]$runnerTokens,
+  [ref]$runnerParseErrors
+)
+Assert-True ($runnerParseErrors.Count -eq 0) `
+  "invoke-model-training.ps1 has resume parser errors: $runnerParseErrors"
+foreach ($functionName in @(
+  'Get-ModelTrainingRunStartState',
+  'Write-ModelTrainingResumeSessionMarker',
+  'Remove-CompletedArchiveCheckpointStore'
+)) {
+  $functionAst = @($runnerAst.FindAll({
+    param($node)
+    ($node -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and
+      ($node.Name -ceq $functionName)
+  }, $true))
+  Assert-True ($functionAst.Count -eq 1) `
+    "The runner must define exactly one $functionName function."
+  if ($functionAst.Count -eq 1) {
+    . ([scriptblock]::Create($functionAst[0].Extent.Text))
+  }
+}
+
+$resumeTestBase = ConvertTo-NormalizedFullPath ([System.IO.Path]::GetTempPath())
+$resumeTestRoot = Join-Path $resumeTestBase `
+  "Flippars-resume-state-$([guid]::NewGuid().ToString('N'))"
 try {
-  $childPowerShell = @(
-    (Join-Path $PSHOME 'pwsh.exe'),
-    (Join-Path $PSHOME 'powershell.exe')
-  ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
-  if ([string]::IsNullOrWhiteSpace($childPowerShell)) {
-    throw 'Unable to resolve a child PowerShell executable for native-exit testing.'
+  $resumeProcessedRoot = Join-Path $resumeTestRoot 'processed'
+  $resumeArtifactRoot = Join-Path $resumeTestRoot 'artifact'
+  $resumeEvidenceRoot = Join-Path $resumeTestRoot 'evidence'
+  $resumePreparedPath = Join-Path $resumeProcessedRoot 'prepared.jsonl'
+  $resumeManifestPath = Join-Path $resumeProcessedRoot 'dataset-manifest.json'
+  $resumeCheckpointRoot = Join-Path $resumeProcessedRoot '.prepared.jsonl.archive-checkpoints'
+  $resumeCommandLog = Join-Path $resumeEvidenceRoot 'training-command-output.log'
+
+  $freshState = Get-ModelTrainingRunStartState `
+    -ProcessedRoot $resumeProcessedRoot `
+    -ArtifactRoot $resumeArtifactRoot `
+    -EvidenceRoot $resumeEvidenceRoot `
+    -PreparedPath $resumePreparedPath `
+    -DatasetManifestPath $resumeManifestPath `
+    -CheckpointRoot $resumeCheckpointRoot `
+    -CommandLogPath $resumeCommandLog
+  Assert-True ($freshState.Kind -ceq 'Fresh' -and
+      -not [bool]$freshState.SkipPreparation -and
+      -not [bool]$freshState.AppendFirstChild) `
+    'Unused roots must be admitted only as a fresh create-new run.'
+
+  New-Item -ItemType Directory -Path $resumeCheckpointRoot -Force | Out-Null
+  New-Item -ItemType Directory -Path $resumeEvidenceRoot -Force | Out-Null
+  [System.IO.File]::WriteAllText(
+    $resumeCommandLog,
+    "prior failure`n",
+    [System.Text.UTF8Encoding]::new($false)
+  )
+  $emptyCheckpointResumeState = Get-ModelTrainingRunStartState `
+    -ProcessedRoot $resumeProcessedRoot `
+    -ArtifactRoot $resumeArtifactRoot `
+    -EvidenceRoot $resumeEvidenceRoot `
+    -PreparedPath $resumePreparedPath `
+    -DatasetManifestPath $resumeManifestPath `
+    -CheckpointRoot $resumeCheckpointRoot `
+    -CommandLogPath $resumeCommandLog `
+    -Resume
+  Assert-True ($emptyCheckpointResumeState.Kind -ceq 'ArchivePreparation') `
+    'An exact empty checkpoint store must resume archive preparation.'
+
+  New-Item -ItemType Directory -Path (Join-Path $resumeCheckpointRoot 'archives') | Out-Null
+  $archivesOnlyResumeState = Get-ModelTrainingRunStartState `
+    -ProcessedRoot $resumeProcessedRoot `
+    -ArtifactRoot $resumeArtifactRoot `
+    -EvidenceRoot $resumeEvidenceRoot `
+    -PreparedPath $resumePreparedPath `
+    -DatasetManifestPath $resumeManifestPath `
+    -CheckpointRoot $resumeCheckpointRoot `
+    -CommandLogPath $resumeCommandLog `
+    -Resume
+  Assert-True ($archivesOnlyResumeState.Kind -ceq 'ArchivePreparation') `
+    'An exact checkpoint store containing only an empty real archives directory must resume.'
+
+  [System.IO.File]::WriteAllText(
+    (Join-Path $resumeCheckpointRoot 'plan.json'),
+    "{}`n",
+    [System.Text.UTF8Encoding]::new($false)
+  )
+  $archiveResumeState = Get-ModelTrainingRunStartState `
+    -ProcessedRoot $resumeProcessedRoot `
+    -ArtifactRoot $resumeArtifactRoot `
+    -EvidenceRoot $resumeEvidenceRoot `
+    -PreparedPath $resumePreparedPath `
+    -DatasetManifestPath $resumeManifestPath `
+    -CheckpointRoot $resumeCheckpointRoot `
+    -CommandLogPath $resumeCommandLog `
+    -Resume
+  Assert-True ($archiveResumeState.Kind -ceq 'ArchivePreparation' -and
+      -not [bool]$archiveResumeState.SkipPreparation -and
+      [bool]$archiveResumeState.AppendFirstChild) `
+    'A checkpoint-only processed root must resume archive preparation in place.'
+
+  [System.IO.File]::WriteAllText(
+    $resumePreparedPath,
+    "{}`n",
+    [System.Text.UTF8Encoding]::new($false)
+  )
+  [System.IO.File]::WriteAllText(
+    $resumeManifestPath,
+    "{}`n",
+    [System.Text.UTF8Encoding]::new($false)
+  )
+  $completedOutputCheckpointState = Get-ModelTrainingRunStartState `
+    -ProcessedRoot $resumeProcessedRoot `
+    -ArtifactRoot $resumeArtifactRoot `
+    -EvidenceRoot $resumeEvidenceRoot `
+    -PreparedPath $resumePreparedPath `
+    -DatasetManifestPath $resumeManifestPath `
+    -CheckpointRoot $resumeCheckpointRoot `
+    -CommandLogPath $resumeCommandLog `
+    -Resume
+  Assert-True ($completedOutputCheckpointState.Kind -ceq 'ArchivePreparation' -and
+      -not [bool]$completedOutputCheckpointState.SkipPreparation) `
+    'A completed output pair plus normal checkpoints must invoke strict Python reconciliation.'
+  Remove-Item -LiteralPath $resumePreparedPath -Force
+  Remove-Item -LiteralPath $resumeManifestPath -Force
+
+  $safePreparedTemporary = Join-Path $resumeProcessedRoot `
+    '.prepared.jsonl.a1b2c3d4.part'
+  $safeManifestTemporary = Join-Path $resumeProcessedRoot `
+    '.dataset-manifest.json.A1-b2_C3.part'
+  [System.IO.File]::WriteAllBytes($safePreparedTemporary, [byte[]](1, 2, 3))
+  [System.IO.File]::WriteAllBytes($safeManifestTemporary, [byte[]]@())
+  $temporaryResumeState = Get-ModelTrainingRunStartState `
+    -ProcessedRoot $resumeProcessedRoot `
+    -ArtifactRoot $resumeArtifactRoot `
+    -EvidenceRoot $resumeEvidenceRoot `
+    -PreparedPath $resumePreparedPath `
+    -DatasetManifestPath $resumeManifestPath `
+    -CheckpointRoot $resumeCheckpointRoot `
+    -CommandLogPath $resumeCommandLog `
+    -Resume
+  Assert-True ($temporaryResumeState.Kind -ceq 'ArchivePreparation') `
+    'Checkpoint resume must admit only exact target-derived CPython temporary siblings.'
+  Remove-Item -LiteralPath $safePreparedTemporary -Force
+  Remove-Item -LiteralPath $safeManifestTemporary -Force
+
+  [System.IO.File]::WriteAllText(
+    $resumePreparedPath,
+    "{}`n",
+    [System.Text.UTF8Encoding]::new($false)
+  )
+  $publishedOutputResumeState = Get-ModelTrainingRunStartState `
+    -ProcessedRoot $resumeProcessedRoot `
+    -ArtifactRoot $resumeArtifactRoot `
+    -EvidenceRoot $resumeEvidenceRoot `
+    -PreparedPath $resumePreparedPath `
+    -DatasetManifestPath $resumeManifestPath `
+    -CheckpointRoot $resumeCheckpointRoot `
+    -CommandLogPath $resumeCommandLog `
+    -Resume
+  Assert-True ($publishedOutputResumeState.Kind -ceq 'ArchivePreparation' -and
+      -not [bool]$publishedOutputResumeState.SkipPreparation) `
+    'A published dataset plus checkpoints and no manifest must replay preparation finalization.'
+  Remove-Item -LiteralPath $resumePreparedPath -Force
+  [System.IO.File]::WriteAllText(
+    $resumeManifestPath,
+    "{}`n",
+    [System.Text.UTF8Encoding]::new($false)
+  )
+  Assert-Throws {
+    Get-ModelTrainingRunStartState `
+      -ProcessedRoot $resumeProcessedRoot `
+      -ArtifactRoot $resumeArtifactRoot `
+      -EvidenceRoot $resumeEvidenceRoot `
+      -PreparedPath $resumePreparedPath `
+      -DatasetManifestPath $resumeManifestPath `
+      -CheckpointRoot $resumeCheckpointRoot `
+      -CommandLogPath $resumeCommandLog `
+      -Resume
+  } 'Checkpoint resume must reject a manifest without its published dataset.'
+  Remove-Item -LiteralPath $resumeManifestPath -Force
+
+  Remove-Item -LiteralPath (Join-Path $resumeCheckpointRoot 'plan.json') -Force
+  $initialPlanTemporary = Join-Path $resumeCheckpointRoot `
+    '.plan.json.Q1-w2_E3.part'
+  [System.IO.File]::WriteAllBytes($initialPlanTemporary, [byte[]](1, 2, 3))
+  $initialPlanResumeState = Get-ModelTrainingRunStartState `
+    -ProcessedRoot $resumeProcessedRoot `
+    -ArtifactRoot $resumeArtifactRoot `
+    -EvidenceRoot $resumeEvidenceRoot `
+    -PreparedPath $resumePreparedPath `
+    -DatasetManifestPath $resumeManifestPath `
+    -CheckpointRoot $resumeCheckpointRoot `
+    -CommandLogPath $resumeCommandLog `
+    -Resume
+  Assert-True ($initialPlanResumeState.Kind -ceq 'ArchivePreparation') `
+    'An exact empty initial checkpoint-plan publication must resume preparation.'
+  $secondPlanTemporary = Join-Path $resumeCheckpointRoot `
+    '.plan.json.R4-x5_F6.part'
+  [System.IO.File]::WriteAllBytes($secondPlanTemporary, [byte[]](4, 5, 6))
+  Assert-Throws {
+    Get-ModelTrainingRunStartState `
+      -ProcessedRoot $resumeProcessedRoot `
+      -ArtifactRoot $resumeArtifactRoot `
+      -EvidenceRoot $resumeEvidenceRoot `
+      -PreparedPath $resumePreparedPath `
+      -DatasetManifestPath $resumeManifestPath `
+      -CheckpointRoot $resumeCheckpointRoot `
+      -CommandLogPath $resumeCommandLog `
+      -Resume
+  } 'Initial plan resume must reject multiple temporary plans.'
+  Remove-Item -LiteralPath $initialPlanTemporary -Force
+  Remove-Item -LiteralPath $secondPlanTemporary -Force
+  [System.IO.File]::WriteAllText(
+    (Join-Path $resumeCheckpointRoot 'plan.json'),
+    "{}`n",
+    [System.Text.UTF8Encoding]::new($false)
+  )
+
+  $unsafeTemporary = Join-Path $resumeProcessedRoot '.prepared.jsonl.evil.part'
+  [System.IO.File]::WriteAllBytes($unsafeTemporary, [byte[]](1))
+  Assert-Throws {
+    Get-ModelTrainingRunStartState `
+      -ProcessedRoot $resumeProcessedRoot `
+      -ArtifactRoot $resumeArtifactRoot `
+      -EvidenceRoot $resumeEvidenceRoot `
+      -PreparedPath $resumePreparedPath `
+      -DatasetManifestPath $resumeManifestPath `
+      -CheckpointRoot $resumeCheckpointRoot `
+      -CommandLogPath $resumeCommandLog `
+      -Resume
+  } 'Checkpoint resume must reject a malformed temporary sibling name.'
+  Remove-Item -LiteralPath $unsafeTemporary -Force
+
+  Write-ModelTrainingResumeSessionMarker `
+    -LogPath $resumeCommandLog `
+    -State $archiveResumeState.Kind `
+    -Version 'btc-spot-test.resume01'
+  $resumeMarkerText = Get-Content -LiteralPath $resumeCommandLog -Raw
+  $resumeMarkerBytes = [System.IO.File]::ReadAllBytes($resumeCommandLog)
+  Assert-True ($resumeMarkerText.StartsWith("prior failure`n")) `
+    'The resume session marker must preserve existing command evidence.'
+  Assert-True ($resumeMarkerText -match
+      '\[flippars-resume-session\] startedAt=.+ state=ArchivePreparation version=btc-spot-test\.resume01') `
+    'The durable resume marker must record state and same-version identity.'
+  Assert-True (-not ($resumeMarkerBytes.Length -ge 3 -and
+      $resumeMarkerBytes[0] -eq 0xef -and
+      $resumeMarkerBytes[1] -eq 0xbb -and
+      $resumeMarkerBytes[2] -eq 0xbf)) `
+    'The resumed command log must remain UTF-8 without a BOM.'
+
+  [System.IO.File]::WriteAllText(
+    (Join-Path $resumeProcessedRoot 'unexpected.txt'),
+    'x',
+    [System.Text.UTF8Encoding]::new($false)
+  )
+  Assert-Throws {
+    Get-ModelTrainingRunStartState `
+      -ProcessedRoot $resumeProcessedRoot `
+      -ArtifactRoot $resumeArtifactRoot `
+      -EvidenceRoot $resumeEvidenceRoot `
+      -PreparedPath $resumePreparedPath `
+      -DatasetManifestPath $resumeManifestPath `
+      -CheckpointRoot $resumeCheckpointRoot `
+      -CommandLogPath $resumeCommandLog `
+      -Resume
+  } 'Resume must reject unexpected processed-root content.'
+  Remove-Item -LiteralPath (Join-Path $resumeProcessedRoot 'unexpected.txt') -Force
+
+  New-Item -ItemType Directory -Path $resumeArtifactRoot -Force | Out-Null
+  Assert-Throws {
+    Get-ModelTrainingRunStartState `
+      -ProcessedRoot $resumeProcessedRoot `
+      -ArtifactRoot $resumeArtifactRoot `
+      -EvidenceRoot $resumeEvidenceRoot `
+      -PreparedPath $resumePreparedPath `
+      -DatasetManifestPath $resumeManifestPath `
+      -CheckpointRoot $resumeCheckpointRoot `
+      -CommandLogPath $resumeCommandLog `
+      -Resume
+  } 'Resume must reject any existing artifact root.'
+  Remove-Item -LiteralPath $resumeArtifactRoot -Recurse -Force
+
+  [System.IO.File]::WriteAllText(
+    (Join-Path $resumeEvidenceRoot 'run-manifest.json'),
+    "{}`n",
+    [System.Text.UTF8Encoding]::new($false)
+  )
+  Assert-Throws {
+    Get-ModelTrainingRunStartState `
+      -ProcessedRoot $resumeProcessedRoot `
+      -ArtifactRoot $resumeArtifactRoot `
+      -EvidenceRoot $resumeEvidenceRoot `
+      -PreparedPath $resumePreparedPath `
+      -DatasetManifestPath $resumeManifestPath `
+      -CheckpointRoot $resumeCheckpointRoot `
+      -CommandLogPath $resumeCommandLog `
+      -Resume
+  } 'Resume must reject run-manifest or other unexpected evidence.'
+  Remove-Item -LiteralPath (Join-Path $resumeEvidenceRoot 'run-manifest.json') -Force
+
+  Remove-Item -LiteralPath $resumeProcessedRoot -Recurse -Force
+  New-Item -ItemType Directory -Path $resumeProcessedRoot -Force | Out-Null
+  [System.IO.File]::WriteAllText(
+    $resumePreparedPath,
+    "{}`n",
+    [System.Text.UTF8Encoding]::new($false)
+  )
+  [System.IO.File]::WriteAllText(
+    $resumeManifestPath,
+    "{}`n",
+    [System.Text.UTF8Encoding]::new($false)
+  )
+  $preparedResumeState = Get-ModelTrainingRunStartState `
+    -ProcessedRoot $resumeProcessedRoot `
+    -ArtifactRoot $resumeArtifactRoot `
+    -EvidenceRoot $resumeEvidenceRoot `
+    -PreparedPath $resumePreparedPath `
+    -DatasetManifestPath $resumeManifestPath `
+    -CheckpointRoot $resumeCheckpointRoot `
+    -CommandLogPath $resumeCommandLog `
+    -Resume
+  Assert-True ($preparedResumeState.Kind -ceq 'PreparedDataset' -and
+      [bool]$preparedResumeState.SkipPreparation -and
+      [bool]$preparedResumeState.AppendFirstChild) `
+    'An exact prepared pair must skip preparation and restart fitting in place.'
+
+  $cleanupProcessedRoot = Join-Path $resumeTestRoot 'completed-cleanup'
+  $cleanupCheckpointRoot = Join-Path $cleanupProcessedRoot `
+    '.prepared.jsonl.archive-checkpoints'
+  New-Item -ItemType Directory -Path (Join-Path $cleanupCheckpointRoot 'nested') -Force |
+    Out-Null
+  [System.IO.File]::WriteAllText(
+    (Join-Path $cleanupCheckpointRoot 'nested\checkpoint.json'),
+    "{}`n",
+    [System.Text.UTF8Encoding]::new($false)
+  )
+  $cleanupResult = Remove-CompletedArchiveCheckpointStore `
+    -ProcessedRoot $cleanupProcessedRoot `
+    -CheckpointRoot $cleanupCheckpointRoot
+  Assert-True ([bool]$cleanupResult -and
+      -not (Test-Path -LiteralPath $cleanupCheckpointRoot)) `
+    'Post-completion cleanup must remove only the exact real checkpoint directory.'
+
+  $cleanupDecoyRoot = Join-Path $cleanupProcessedRoot 'checkpoint-decoy'
+  New-Item -ItemType Directory -Path $cleanupDecoyRoot | Out-Null
+  $decoyCleanupResult = Remove-CompletedArchiveCheckpointStore `
+    -ProcessedRoot $cleanupProcessedRoot `
+    -CheckpointRoot $cleanupDecoyRoot `
+    -WarningAction SilentlyContinue
+  Assert-True (-not [bool]$decoyCleanupResult -and
+      (Test-Path -LiteralPath $cleanupDecoyRoot -PathType Container)) `
+    'Post-completion cleanup must preserve a non-governed sibling directory.'
+
+  [System.IO.File]::WriteAllText(
+    $resumeCommandLog,
+    '',
+    [System.Text.UTF8Encoding]::new($false)
+  )
+  Assert-Throws {
+    Get-ModelTrainingRunStartState `
+      -ProcessedRoot $resumeProcessedRoot `
+      -ArtifactRoot $resumeArtifactRoot `
+      -EvidenceRoot $resumeEvidenceRoot `
+      -PreparedPath $resumePreparedPath `
+      -DatasetManifestPath $resumeManifestPath `
+      -CheckpointRoot $resumeCheckpointRoot `
+      -CommandLogPath $resumeCommandLog `
+      -Resume
+  } 'Resume must reject an empty prior command log.'
+  Assert-Throws {
+    Get-ModelTrainingRunStartState `
+      -ProcessedRoot $resumeProcessedRoot `
+      -ArtifactRoot $resumeArtifactRoot `
+      -EvidenceRoot $resumeEvidenceRoot `
+      -PreparedPath $resumePreparedPath `
+      -DatasetManifestPath $resumeManifestPath `
+      -CheckpointRoot $resumeCheckpointRoot `
+      -CommandLogPath $resumeCommandLog
+  } 'Fresh mode must continue to reject every existing run root.'
+} finally {
+  if (Test-Path -LiteralPath $resumeTestRoot) {
+    $resolvedResumeTestRoot = ConvertTo-NormalizedFullPath $resumeTestRoot
+    if (($resolvedResumeTestRoot -eq $resumeTestBase) -or
+        (-not (Test-PathWithin $resolvedResumeTestRoot $resumeTestBase))) {
+      throw "Refusing unsafe resume-test cleanup: $resolvedResumeTestRoot"
+    }
+    Remove-Item -LiteralPath $resolvedResumeTestRoot -Recurse -Force
   }
+}
+
+$nativeTestId = [guid]::NewGuid().ToString('N')
+$nativeExitLog = Join-Path ([System.IO.Path]::GetTempPath()) `
+  "Flippars-native-exit-$nativeTestId.log"
+$nativeChildScript = Join-Path ([System.IO.Path]::GetTempPath()) `
+  "Flippars-native-child-$nativeTestId.ps1"
+try {
+  $childPowerShell = Join-Path `
+    $env:SystemRoot `
+    'System32\WindowsPowerShell\v1.0\powershell.exe'
+  if (-not (Test-Path -LiteralPath $childPowerShell -PathType Leaf)) {
+    throw 'Windows PowerShell 5.1 is required for native logging regression tests.'
+  }
+  $nativeChildText = @'
+[CmdletBinding()]
+param(
+  [ValidateSet('Failure', 'Append')][string]$Mode = 'Failure',
+  [AllowEmptyString()][string]$ArgumentProbe = '',
+  [AllowEmptyString()][string]$EmptyProbe = 'not-empty'
+)
+
+if ($Mode -eq 'Append') {
+  [Console]::Out.WriteLine('APPEND-STDOUT')
+  [Console]::Error.WriteLine('APPEND-STDERR')
+  exit 0
+}
+
+[Console]::Out.WriteLine('EARLY-STDOUT')
+[Console]::Error.WriteLine('Traceback (most recent call last):')
+for ($index = 0; $index -lt 2048; $index += 1) {
+  [Console]::Out.WriteLine(('OUT-LINE-{0:D4}' -f $index))
+  [Console]::Error.WriteLine(('ERR-LINE-{0:D4}' -f $index))
+}
+[Console]::Error.WriteLine('  File "synthetic.py", line 1, in <module>')
+[Console]::Error.WriteLine('RuntimeError: SYNTHETIC-TRACEBACK-END')
+[Console]::Out.WriteLine("ARGUMENT-PROBE=$ArgumentProbe")
+[Console]::Out.WriteLine("EMPTY-PROBE-LENGTH=$($EmptyProbe.Length)")
+[Console]::Error.Write('FINAL-STDERR-NO-NEWLINE')
+[Console]::Error.Flush()
+exit 17
+'@
+  [System.IO.File]::WriteAllText(
+    $nativeChildScript,
+    $nativeChildText,
+    [System.Text.UTF8Encoding]::new($false)
+  )
+
+  $argumentProbe = 'space "quote" trailing\'
+  $originalConsoleOut = [Console]::Out
+  $originalConsoleError = [Console]::Error
   try {
-    $pipelineErrorActionPreference = $ErrorActionPreference
-    try {
-      $ErrorActionPreference = 'Continue'
-      & $childPowerShell -NoProfile -NonInteractive -Command `
-        "[Console]::Out.WriteLine('EARLY-MARKER'); [Console]::Error.WriteLine('ERROR-MARKER'); exit 17" `
-        2>&1 | Tee-Object -FilePath $nativeExitLog -ErrorAction Stop | Out-Null
-      $nativeExitCode = $LASTEXITCODE
-    } finally {
-      $ErrorActionPreference = $pipelineErrorActionPreference
-    }
-    if ($nativeExitCode -ne 0) {
-      throw "Synthetic native command failed with exit code $nativeExitCode."
-    }
-  } catch {
-    $nativeFailure = $_.Exception.Message
+    [Console]::SetOut([System.IO.TextWriter]::Null)
+    [Console]::SetError([System.IO.TextWriter]::Null)
+    $nativeExitCode = Invoke-LoggedNativeProcess `
+      -FilePath $childPowerShell `
+      -ArgumentList @(
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-File', $nativeChildScript,
+        '-ArgumentProbe', $argumentProbe,
+        '-EmptyProbe', ''
+      ) `
+      -LogPath $nativeExitLog `
+      -WorkingDirectory ([System.IO.Path]::GetTempPath())
+  } finally {
+    [Console]::SetOut($originalConsoleOut)
+    [Console]::SetError($originalConsoleError)
   }
-  $nativeLogText = if (Test-Path -LiteralPath $nativeExitLog -PathType Leaf) {
-    Get-Content -LiteralPath $nativeExitLog -Raw
-  } else {
-    "MISSING-LOG: $nativeFailure"
-  }
-  Assert-True ($nativeFailure -match 'exit code 17') `
-    'A streamed native exit code 17 must propagate as a failure.'
-  Assert-True ($nativeLogText.Contains('EARLY-MARKER')) `
+
+  $nativeLogText = Get-Content -LiteralPath $nativeExitLog -Raw
+  $nativeLogLines = @(Get-Content -LiteralPath $nativeExitLog)
+  Assert-True ($nativeExitCode -eq 17) `
+    'The native logger must return the exact nonzero child exit code.'
+  Assert-True ($nativeLogText.Contains('EARLY-STDOUT')) `
     'Streamed native stdout must reach the evidence log before failure.'
-  Assert-True ($nativeLogText.Contains('ERROR-MARKER')) `
-    'Streamed native stderr must reach the evidence log before failure.'
+  Assert-True ($nativeLogText.Contains('Traceback (most recent call last):')) `
+    'The first traceback line must reach the evidence log.'
+  Assert-True ($nativeLogText.Contains('RuntimeError: SYNTHETIC-TRACEBACK-END')) `
+    'The final traceback line must reach the evidence log.'
+  Assert-True ($nativeLogText.Contains('FINAL-STDERR-NO-NEWLINE')) `
+    'A final stderr line without a newline must reach the evidence log.'
+  Assert-True ((@($nativeLogLines | Where-Object { $_ -match '^OUT-LINE-' })).Count -eq 2048) `
+    'The native logger must drain pressure-volume stdout without truncation.'
+  Assert-True ((@($nativeLogLines | Where-Object { $_ -match '^ERR-LINE-' })).Count -eq 2048) `
+    'The native logger must drain pressure-volume stderr without truncation.'
+  Assert-True ($nativeLogText.Contains("ARGUMENT-PROBE=$argumentProbe")) `
+    'Windows native argument quoting must preserve spaces, quotes, and a trailing backslash.'
+  Assert-True ($nativeLogText.Contains('EMPTY-PROBE-LENGTH=0')) `
+    'Windows native argument quoting must preserve an empty argument.'
+  Assert-True ($nativeLogLines[-1] -ceq '[flippars-native-exit] exitCode=17') `
+    'The native logger must append the deterministic nonzero exit footer after EOF.'
+  foreach ($forbiddenMetadata in @(
+    'NativeCommandError',
+    'CategoryInfo',
+    'FullyQualifiedErrorId'
+  )) {
+    Assert-True (-not $nativeLogText.Contains($forbiddenMetadata)) `
+      "The native logger must not persist PowerShell error metadata: $forbiddenMetadata"
+  }
+
+  try {
+    [Console]::SetOut([System.IO.TextWriter]::Null)
+    [Console]::SetError([System.IO.TextWriter]::Null)
+    $nativeAppendExitCode = Invoke-LoggedNativeProcess `
+      -FilePath $childPowerShell `
+      -ArgumentList @(
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-File', $nativeChildScript,
+        '-Mode', 'Append'
+      ) `
+      -LogPath $nativeExitLog `
+      -WorkingDirectory ([System.IO.Path]::GetTempPath()) `
+      -Append
+  } finally {
+    [Console]::SetOut($originalConsoleOut)
+    [Console]::SetError($originalConsoleError)
+  }
+  $appendedLogText = Get-Content -LiteralPath $nativeExitLog -Raw
+  Assert-True ($nativeAppendExitCode -eq 0) `
+    'The native logger must return a successful append-process exit code.'
+  Assert-True ($appendedLogText.Contains('EARLY-STDOUT') -and
+      $appendedLogText.Contains('APPEND-STDOUT') -and
+      $appendedLogText.Contains('APPEND-STDERR')) `
+    'Append logging must preserve prior evidence and add both new streams.'
+  Assert-Throws {
+    Invoke-LoggedNativeProcess `
+      -FilePath $childPowerShell `
+      -ArgumentList @(
+        '-NoProfile', '-NonInteractive', '-File', $nativeChildScript, '-Mode', 'Append'
+      ) `
+      -LogPath $nativeExitLog `
+      -WorkingDirectory ([System.IO.Path]::GetTempPath())
+  } 'Create-mode native logging must refuse to overwrite existing evidence.'
 } finally {
   if (Test-Path -LiteralPath $nativeExitLog) {
     Remove-Item -LiteralPath $nativeExitLog -Force
+  }
+  if (Test-Path -LiteralPath $nativeChildScript) {
+    Remove-Item -LiteralPath $nativeChildScript -Force
   }
   $global:LASTEXITCODE = 0
 }

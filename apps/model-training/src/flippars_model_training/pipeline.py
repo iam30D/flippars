@@ -52,6 +52,8 @@ ARTIFACT_SCHEMA_VERSION = "flippars.multinomial-candidate/3"
 DATASET_SCHEMA_VERSION = "flippars.training-dataset/3"
 DATASET_MANIFEST_SCHEMA_VERSION = "flippars.dataset-manifest/2"
 DATASET_MANIFEST_SUMMARY_SCHEMA_VERSION = "flippars.dataset-manifest-summary/3"
+ARCHIVE_PREPARATION_PLAN_SCHEMA_VERSION = "flippars.archive-preparation-plan/1"
+ARCHIVE_PREPARATION_CHECKPOINT_SCHEMA_VERSION = "flippars.archive-preparation-checkpoint/1"
 FEATURE_SCHEMA_VERSION = "binance-spot-signal-features/1"
 LABEL_POLICY_VERSION = "binance-spot-trade-close-relation/1"
 DECISION_POLICY_VERSION = "flippars-signal-candidate-sampling/1"
@@ -114,6 +116,14 @@ VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,79}$")
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$")
 MAX_CHECKSUM_BYTES = 1_024
 MAX_ARCHIVE_MEMBER_BYTES = 16 * 1_024 * 1_024 * 1_024
+CHECKPOINT_SAFE_TEMPORARY_TOKEN = r"[A-Za-z0-9_-]{8}"
+ARCHIVE_CHECKPOINT_DIRECTORY_PATTERN = re.compile(r"^[0-9]{8}$")
+ARCHIVE_CHECKPOINT_TEMPORARY_PATTERN = re.compile(
+    rf"^\.[0-9]{{8}}\.{CHECKPOINT_SAFE_TEMPORARY_TOKEN}\.part$"
+)
+ARCHIVE_PLAN_TEMPORARY_PATTERN = re.compile(
+    rf"^\.plan\.json\.{CHECKPOINT_SAFE_TEMPORARY_TOKEN}\.part$"
+)
 
 
 @dataclass(frozen=True)
@@ -404,15 +414,1154 @@ def prepare_archives(
         for previous, current in zip(typed_archive_days, typed_archive_days[1:])
     ):
         raise ValueError("Source archive dates must form one contiguous UTC range")
-    reports: list[ArchiveReport] = []
-    gap_starts: list[datetime] = []
-    rows = iter_archive_rows(ordered_archives, options, reports, gap_starts)
-    return write_prepared_dataset(
-        rows=rows,
+    return write_resumable_archive_dataset(
+        archives=ordered_archives,
+        output=output,
+        manifest_output=manifest_output,
+        options=options,
+        acquisition_manifest_path=acquisition_manifest_path,
+    )
+
+
+def archive_checkpoint_root(output: Path) -> Path:
+    return output.parent / f".{output.name}.archive-checkpoints"
+
+
+def build_archive_preparation_plan(
+    *,
+    archives: Sequence[Path],
+    output: Path,
+    manifest_output: Path,
+    options: DatasetOptions,
+    acquisition_manifest_path: Path | None,
+) -> dict[str, object]:
+    archive_inputs: list[dict[str, object]] = []
+    for archive_index, archive_path in enumerate(archives, start=1):
+        if archive_path.is_symlink() or not archive_path.is_file():
+            raise ValueError(f"Checkpoint input is not a regular archive: {archive_path}")
+        checksum_path = archive_path.with_suffix(archive_path.suffix + ".CHECKSUM")
+        expected_sha256, checksum_bytes, checksum_sha256 = read_checksum_snapshot(
+            checksum_path, archive_path.name
+        )
+        archive_inputs.append(
+            {
+                "archiveIndex": archive_index,
+                "path": str(archive_path.resolve()),
+                "name": archive_path.name,
+                "bytes": archive_path.stat().st_size,
+                "expectedSha256": expected_sha256,
+                "checksumName": checksum_path.name,
+                "checksumBytes": checksum_bytes,
+                "checksumSha256": checksum_sha256,
+            }
+        )
+    acquisition_input: dict[str, object] | None = None
+    if acquisition_manifest_path is not None:
+        if acquisition_manifest_path.is_symlink() or not acquisition_manifest_path.is_file():
+            raise ValueError(
+                f"Checkpoint acquisition input is not a regular file: "
+                f"{acquisition_manifest_path}"
+            )
+        acquisition_input = {
+            "path": str(acquisition_manifest_path.resolve()),
+            "bytes": acquisition_manifest_path.stat().st_size,
+            "sha256": sha256_file(acquisition_manifest_path),
+        }
+    pipeline_path = Path(__file__).resolve()
+    fingerprint_input = {
+        "archives": archive_inputs,
+        "acquisitionManifest": acquisition_input,
+        "options": asdict(options),
+        "output": str(output.resolve()),
+        "manifestOutput": str(manifest_output.resolve()),
+        "schemas": {
+            "dataset": DATASET_SCHEMA_VERSION,
+            "datasetManifest": DATASET_MANIFEST_SCHEMA_VERSION,
+            "feature": FEATURE_SCHEMA_VERSION,
+            "labelPolicy": LABEL_POLICY_VERSION,
+            "decisionPolicy": DECISION_POLICY_VERSION,
+        },
+        "featureNames": list(FEATURE_NAMES),
+        "generator": {
+            **runtime_metadata(),
+            "pipelineSha256": sha256_file(pipeline_path),
+        },
+    }
+    fingerprint = hashlib.sha256(
+        canonical_json(fingerprint_input).encode("utf-8")
+    ).hexdigest()
+    return {
+        "schemaVersion": ARCHIVE_PREPARATION_PLAN_SCHEMA_VERSION,
+        "fingerprintSha256": fingerprint,
+        "inputs": fingerprint_input,
+    }
+
+
+def require_exact_checkpoint_keys(
+    value: object, expected: Sequence[str], label: str
+) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != set(expected):
+        raise ValueError(f"{label} must contain exactly {list(expected)}")
+    if not all(isinstance(key, str) for key in value):
+        raise ValueError(f"{label} keys must be strings")
+    return value
+
+
+def checkpoint_integer(value: object, label: str, *, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"{label} must be an integer greater than or equal to {minimum}")
+    return value
+
+
+def checkpoint_optional_string(value: object, label: str) -> str | None:
+    if value is not None and (not isinstance(value, str) or not value):
+        raise ValueError(f"{label} must be null or a non-empty string")
+    return value
+
+
+def checkpoint_key(value: object, label: str) -> tuple[str, str] | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, list)
+        or len(value) != 2
+        or not all(isinstance(part, str) and part for part in value)
+    ):
+        raise ValueError(f"{label} must be null or a two-string key")
+    return value[0], value[1]
+
+
+def checkpoint_identity_sha256(value: dict[str, object]) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def initialize_archive_checkpoint_store(
+    checkpoint_root: Path, expected_plan: dict[str, object]
+) -> Path:
+    plan_path = checkpoint_root / "plan.json"
+    archives_root = checkpoint_root / "archives"
+    if checkpoint_root.exists():
+        if checkpoint_root.is_symlink() or not checkpoint_root.is_dir():
+            raise ValueError(f"Invalid archive checkpoint root: {checkpoint_root}")
+        actual_names = {entry.name for entry in checkpoint_root.iterdir()}
+        if not actual_names:
+            archives_root.mkdir(exist_ok=False)
+            write_new_json(plan_path, expected_plan)
+            return archives_root
+        plan_temporaries = [
+            entry
+            for entry in checkpoint_root.iterdir()
+            if ARCHIVE_PLAN_TEMPORARY_PATTERN.fullmatch(entry.name) is not None
+        ]
+        if len(plan_temporaries) == 1 and actual_names == {
+            "archives",
+            plan_temporaries[0].name,
+        }:
+            temporary = plan_temporaries[0]
+            if archives_root.is_symlink() or not archives_root.is_dir():
+                raise ValueError("Abandoned archive checkpoint store is ambiguous")
+            if any(archives_root.iterdir()):
+                raise ValueError("Abandoned archive checkpoint store is not empty")
+            if temporary.is_symlink() or not temporary.is_file():
+                raise ValueError("Abandoned archive checkpoint plan temporary is invalid")
+            temporary.unlink()
+            write_new_json(plan_path, expected_plan)
+            return archives_root
+        if actual_names == {"archives"}:
+            if archives_root.is_symlink() or not archives_root.is_dir():
+                raise ValueError("Abandoned archive checkpoint store is ambiguous")
+            if any(archives_root.iterdir()):
+                raise ValueError("Abandoned archive checkpoint store is not empty")
+            write_new_json(plan_path, expected_plan)
+            return archives_root
+        if actual_names != {"archives", "plan.json"}:
+            raise ValueError("Archive checkpoint root contains unexpected entries")
+        if archives_root.is_symlink() or not archives_root.is_dir():
+            raise ValueError("Archive checkpoint store is missing its real archives directory")
+        if plan_path.is_symlink() or not plan_path.is_file():
+            raise ValueError("Archive checkpoint plan is not a regular file")
+        actual_plan, _ = read_json_object_and_sha256(plan_path)
+        if actual_plan != expected_plan:
+            raise ValueError("Archive checkpoint plan does not match current immutable inputs")
+        return archives_root
+    checkpoint_root.mkdir(parents=False, exist_ok=False)
+    try:
+        archives_root.mkdir(exist_ok=False)
+        write_new_json(plan_path, expected_plan)
+    except BaseException:
+        shutil.rmtree(checkpoint_root, ignore_errors=True)
+        raise
+    return archives_root
+
+
+def validate_checkpoint_report(
+    value: object,
+    label: str,
+    *,
+    expected_previous_id: str | None,
+    expected_previous_event: str | None,
+) -> ArchiveReport:
+    expected_fields = tuple(ArchiveReport.__dataclass_fields__)
+    report_value = require_exact_checkpoint_keys(value, expected_fields, label)
+    try:
+        report = ArchiveReport(**report_value)
+    except TypeError as error:
+        raise ValueError(f"{label} is invalid") from error
+    if asdict(report) != report_value:
+        raise ValueError(f"{label} does not round-trip exactly")
+    string_fields = (
+        "archive",
+        "symbol",
+        "day",
+        "archive_sha256",
+        "expected_sha256",
+        "member",
+        "checksum_name",
+        "checksum_sha256",
+        "normalized_file",
+        "normalized_sha256",
+    )
+    for field_name in string_fields:
+        if not isinstance(getattr(report, field_name), str):
+            raise ValueError(f"{label}.{field_name} must be a string")
+    counter_fields = (
+        "archive_bytes",
+        "checksum_bytes",
+        "accepted_trade_count",
+        "rejected_trade_count",
+        "duplicate_trade_count",
+        "out_of_order_trade_count",
+        "missing_trade_id_count",
+    )
+    for field_name in counter_fields:
+        checkpoint_integer(getattr(report, field_name), f"{label}.{field_name}")
+    match = ARCHIVE_PATTERN.fullmatch(report.archive)
+    if (
+        match is None
+        or report.symbol != SUPPORTED_SYMBOL
+        or match.group("symbol") != report.symbol
+        or report.day != match.group("day")
+        or report.member != f"{report.archive[:-4]}.csv"
+    ):
+        raise ValueError(f"{label} archive identity is invalid")
+    try:
+        report_day = date.fromisoformat(report.day)
+    except ValueError as error:
+        raise ValueError(f"{label}.day is invalid") from error
+    if report_day.isoformat() != report.day:
+        raise ValueError(f"{label}.day is not canonical")
+    for digest_name in ("archive_sha256", "expected_sha256", "checksum_sha256"):
+        if re.fullmatch(r"[a-f0-9]{64}", getattr(report, digest_name)) is None:
+            raise ValueError(f"{label}.{digest_name} is invalid")
+    if (
+        report.archive_bytes < 1
+        or not 1 <= report.checksum_bytes <= MAX_CHECKSUM_BYTES
+        or report.accepted_trade_count < 1
+        or report.rejected_trade_count != 0
+        or report.out_of_order_trade_count != 0
+        or report.missing_trade_id_count != 0
+        or report.missing_trade_id_ranges != []
+        or report.normalized_file != ""
+        or report.normalized_sha256 != ""
+    ):
+        raise ValueError(f"{label} counters or streamed-source fields are invalid")
+    first_id = checkpoint_optional_string(report.first_trade_id, f"{label}.first_trade_id")
+    last_id = checkpoint_optional_string(report.last_trade_id, f"{label}.last_trade_id")
+    if (
+        first_id is None
+        or last_id is None
+        or not first_id.isdigit()
+        or not last_id.isdigit()
+        or int(first_id) < 1
+        or int(last_id) < int(first_id)
+        or report.accepted_trade_count != int(last_id) - int(first_id) + 1
+    ):
+        raise ValueError(f"{label} trade-ID range is invalid")
+    if expected_previous_id is not None and int(first_id) != int(expected_previous_id) + 1:
+        raise ValueError(f"{label} trade-ID chain is discontinuous")
+    first_event_text = checkpoint_optional_string(
+        report.first_event_at, f"{label}.first_event_at"
+    )
+    last_event_text = checkpoint_optional_string(
+        report.last_event_at, f"{label}.last_event_at"
+    )
+    if first_event_text is None or last_event_text is None:
+        raise ValueError(f"{label} event-time range is missing")
+    first_event = parse_timestamp(first_event_text)
+    last_event = parse_timestamp(last_event_text)
+    day_start = datetime(report_day.year, report_day.month, report_day.day, tzinfo=UTC)
+    if (
+        format_timestamp(first_event) != first_event_text
+        or format_timestamp(last_event) != last_event_text
+        or not day_start <= first_event <= last_event < day_start + timedelta(days=1)
+    ):
+        raise ValueError(f"{label} event-time range is invalid")
+    if expected_previous_event is not None and first_event < parse_timestamp(
+        expected_previous_event
+    ):
+        raise ValueError(f"{label} event-time chain regressed")
+    return report
+
+
+def summarize_checkpoint_chunk(
+    chunk_path: Path,
+    *,
+    previous_row_key: tuple[str, str] | None,
+    previous_window: str | None,
+) -> tuple[dict[str, object], tuple[str, str] | None, str | None]:
+    if chunk_path.is_symlink() or not chunk_path.is_file():
+        raise ValueError("Archive checkpoint row chunk is not a regular file")
+    digest = hashlib.sha256()
+    byte_count = 0
+    row_count = 0
+    window_count = 0
+    first_key: tuple[str, str] | None = None
+    current_last_key: tuple[str, str] | None = None
+    monotonic_key = previous_row_key
+    first_window: str | None = None
+    current_last_window: str | None = None
+    monotonic_window = previous_window
+    last_window_end: str | None = None
+    with chunk_path.open("rb") as handle:
+        for line in handle:
+            digest.update(line)
+            byte_count += len(line)
+            if not line.endswith(b"\n"):
+                raise ValueError("Archive checkpoint row chunks must end every row with LF")
+            try:
+                row = json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ValueError("Archive checkpoint row chunk contains invalid JSON") from error
+            if not isinstance(row, dict) or (canonical_json(row) + "\n").encode(
+                "utf-8"
+            ) != line:
+                raise ValueError("Archive checkpoint row chunk is not canonically encoded")
+            boundary_values = {
+                name: row.get(name)
+                for name in ("decisionAt", "id", "windowStart", "windowEnd")
+            }
+            if any(
+                not isinstance(value, str) or not value
+                for value in boundary_values.values()
+            ):
+                raise ValueError("Archive checkpoint row boundaries must be non-empty strings")
+            key = boundary_values["decisionAt"], boundary_values["id"]
+            window = boundary_values["windowStart"]
+            if monotonic_key is not None and key <= monotonic_key:
+                raise ValueError("Archive checkpoint row keys are not globally monotonic")
+            if monotonic_window is not None and window < monotonic_window:
+                raise ValueError("Archive checkpoint windows are not globally monotonic")
+            if window != monotonic_window:
+                window_count += 1
+            first_key = first_key or key
+            first_window = first_window or window
+            current_last_key = key
+            current_last_window = window
+            monotonic_key = key
+            monotonic_window = window
+            last_window_end = boundary_values["windowEnd"]
+            row_count += 1
+    summary = {
+        "path": "rows.jsonl",
+        "bytes": byte_count,
+        "sha256": digest.hexdigest(),
+        "rowCount": row_count,
+        "windowCount": window_count,
+        "firstKey": list(first_key) if first_key is not None else None,
+        "lastKey": list(current_last_key) if current_last_key is not None else None,
+        "firstWindow": first_window,
+        "lastWindow": current_last_window,
+        "lastWindowEnd": last_window_end,
+    }
+    return summary, monotonic_key, monotonic_window
+
+
+def validate_archive_checkpoint(
+    *,
+    checkpoint_path: Path,
+    chunk_path: Path,
+    expected_plan: dict[str, object],
+    expected_archive: dict[str, object],
+    expected_index: int,
+    expected_previous_id: str | None,
+    expected_previous_event: str | None,
+    expected_previous_checkpoint_sha256: str | None,
+    previous_row_key: tuple[str, str] | None,
+    previous_window: str | None,
+) -> tuple[
+    dict[str, object],
+    ArchiveReport,
+    tuple[str, str] | None,
+    str | None,
+]:
+    record, _ = read_json_object_and_sha256(checkpoint_path)
+    require_exact_checkpoint_keys(
+        record,
+        (
+            "schemaVersion",
+            "planFingerprintSha256",
+            "previousCheckpointSha256",
+            "checkpointSha256",
+            "archiveIndex",
+            "archiveCount",
+            "archiveInput",
+            "previousState",
+            "nextState",
+            "rows",
+            "report",
+        ),
+        "archive checkpoint",
+    )
+    if record["schemaVersion"] != ARCHIVE_PREPARATION_CHECKPOINT_SCHEMA_VERSION:
+        raise ValueError("Unsupported archive checkpoint schema")
+    if record["planFingerprintSha256"] != expected_plan["fingerprintSha256"]:
+        raise ValueError("Archive checkpoint plan fingerprint mismatch")
+    previous_checkpoint_sha256 = checkpoint_optional_string(
+        record["previousCheckpointSha256"], "previous checkpoint digest"
+    )
+    if previous_checkpoint_sha256 != expected_previous_checkpoint_sha256:
+        raise ValueError("Archive checkpoint digest chain is discontinuous")
+    checkpoint_sha256 = record["checkpointSha256"]
+    if (
+        not isinstance(checkpoint_sha256, str)
+        or re.fullmatch(r"[a-f0-9]{64}", checkpoint_sha256) is None
+    ):
+        raise ValueError("Archive checkpoint identity digest is invalid")
+    identity = dict(record)
+    del identity["checkpointSha256"]
+    if checkpoint_identity_sha256(identity) != checkpoint_sha256:
+        raise ValueError("Archive checkpoint identity digest mismatch")
+    if checkpoint_integer(record["archiveIndex"], "archiveIndex", minimum=1) != expected_index:
+        raise ValueError("Archive checkpoint index mismatch")
+    plan_inputs = require_exact_checkpoint_keys(
+        expected_plan["inputs"],
+        (
+            "archives",
+            "acquisitionManifest",
+            "options",
+            "output",
+            "manifestOutput",
+            "schemas",
+            "featureNames",
+            "generator",
+        ),
+        "archive checkpoint plan inputs",
+    )
+    plan_archives = plan_inputs["archives"]
+    if not isinstance(plan_archives, list):
+        raise ValueError("Archive checkpoint plan archives must be an array")
+    if checkpoint_integer(record["archiveCount"], "archiveCount", minimum=1) != len(
+        plan_archives
+    ):
+        raise ValueError("Archive checkpoint count mismatch")
+    if record["archiveInput"] != expected_archive:
+        raise ValueError("Archive checkpoint input identity mismatch")
+    previous_state = require_exact_checkpoint_keys(
+        record["previousState"], ("lastTradeId", "lastEventAt"), "previous state"
+    )
+    previous_id = checkpoint_optional_string(
+        previous_state["lastTradeId"], "previous lastTradeId"
+    )
+    previous_event = checkpoint_optional_string(
+        previous_state["lastEventAt"], "previous lastEventAt"
+    )
+    if previous_id != expected_previous_id or previous_event != expected_previous_event:
+        raise ValueError("Archive checkpoint state chain is discontinuous")
+    next_state = require_exact_checkpoint_keys(
+        record["nextState"], ("lastTradeId", "lastEventAt"), "next state"
+    )
+    next_id = checkpoint_optional_string(next_state["lastTradeId"], "next lastTradeId")
+    next_event = checkpoint_optional_string(next_state["lastEventAt"], "next lastEventAt")
+    report = validate_checkpoint_report(
+        record["report"],
+        "archive checkpoint report",
+        expected_previous_id=expected_previous_id,
+        expected_previous_event=expected_previous_event,
+    )
+    if (
+        report.archive != expected_archive["name"]
+        or report.archive_sha256 != expected_archive["expectedSha256"]
+        or report.expected_sha256 != expected_archive["expectedSha256"]
+        or report.archive_bytes != expected_archive["bytes"]
+        or report.checksum_name != expected_archive["checksumName"]
+        or report.checksum_bytes != expected_archive["checksumBytes"]
+        or report.checksum_sha256 != expected_archive["checksumSha256"]
+        or report.last_trade_id != next_id
+        or report.last_event_at != next_event
+        or report.missing_trade_id_count != 0
+    ):
+        raise ValueError("Archive checkpoint report does not match its immutable input")
+    rows = require_exact_checkpoint_keys(
+        record["rows"],
+        (
+            "path",
+            "bytes",
+            "sha256",
+            "rowCount",
+            "windowCount",
+            "firstKey",
+            "lastKey",
+            "firstWindow",
+            "lastWindow",
+            "lastWindowEnd",
+        ),
+        "archive checkpoint rows",
+    )
+    if rows["path"] != "rows.jsonl":
+        raise ValueError("Archive checkpoint row path is invalid")
+    row_bytes = checkpoint_integer(rows["bytes"], "row bytes")
+    row_count = checkpoint_integer(rows["rowCount"], "row count")
+    window_count = checkpoint_integer(rows["windowCount"], "window count")
+    digest = rows["sha256"]
+    if not isinstance(digest, str) or re.fullmatch(r"[a-f0-9]{64}", digest) is None:
+        raise ValueError("Archive checkpoint row digest is invalid")
+    if chunk_path.is_symlink() or not chunk_path.is_file():
+        raise ValueError("Archive checkpoint row chunk is not a regular file")
+    if chunk_path.stat().st_size != row_bytes:
+        raise ValueError("Archive checkpoint row chunk hash or size mismatch")
+    first_key = checkpoint_key(rows["firstKey"], "first row key")
+    last_key = checkpoint_key(rows["lastKey"], "last row key")
+    first_window = checkpoint_optional_string(rows["firstWindow"], "first window")
+    last_window = checkpoint_optional_string(rows["lastWindow"], "last window")
+    last_window_end = checkpoint_optional_string(rows["lastWindowEnd"], "last window end")
+    if row_count == 0:
+        if window_count != 0 or any(
+            value is not None
+            for value in (first_key, last_key, first_window, last_window, last_window_end)
+        ):
+            raise ValueError("Empty archive checkpoint has non-empty row boundaries")
+    else:
+        if window_count < 1 or window_count > row_count:
+            raise ValueError("Archive checkpoint window count is inconsistent")
+        if any(
+            value is None
+            for value in (first_key, last_key, first_window, last_window, last_window_end)
+        ):
+            raise ValueError("Non-empty archive checkpoint is missing row boundaries")
+        if first_key > last_key or first_window > last_window:
+            raise ValueError("Archive checkpoint row boundaries are inconsistent")
+    if first_key is not None and previous_row_key is not None and first_key <= previous_row_key:
+        raise ValueError("Archive checkpoint row keys are not globally monotonic")
+    if first_window is not None and previous_window is not None and first_window < previous_window:
+        raise ValueError("Archive checkpoint windows are not globally monotonic")
+    observed_rows, observed_last_key, observed_last_window = summarize_checkpoint_chunk(
+        chunk_path,
+        previous_row_key=previous_row_key,
+        previous_window=previous_window,
+    )
+    if rows != observed_rows:
+        raise ValueError("Archive checkpoint row summary does not match canonical chunk bytes")
+    return record, report, observed_last_key, observed_last_window
+
+
+def load_archive_checkpoints(
+    *,
+    archives_root: Path,
+    expected_plan: dict[str, object],
+) -> list[tuple[dict[str, object], ArchiveReport, Path]]:
+    for entry in list(archives_root.iterdir()):
+        if ARCHIVE_CHECKPOINT_TEMPORARY_PATTERN.fullmatch(entry.name) is not None:
+            if entry.is_symlink() or not entry.is_dir():
+                raise ValueError("Invalid abandoned archive checkpoint temporary entry")
+            shutil.rmtree(entry)
+    entries = sorted(archives_root.iterdir(), key=lambda path: path.name)
+    if any(
+        entry.is_symlink()
+        or not entry.is_dir()
+        or ARCHIVE_CHECKPOINT_DIRECTORY_PATTERN.fullmatch(entry.name) is None
+        for entry in entries
+    ):
+        raise ValueError("Archive checkpoint store contains an unexpected entry")
+    inputs = require_exact_checkpoint_keys(
+        expected_plan["inputs"],
+        (
+            "archives",
+            "acquisitionManifest",
+            "options",
+            "output",
+            "manifestOutput",
+            "schemas",
+            "featureNames",
+            "generator",
+        ),
+        "archive checkpoint plan inputs",
+    )
+    archive_inputs = inputs["archives"]
+    if not isinstance(archive_inputs, list) or len(entries) > len(archive_inputs):
+        raise ValueError("Archive checkpoint count exceeds the immutable plan")
+    checkpoints: list[tuple[dict[str, object], ArchiveReport, Path]] = []
+    previous_id: str | None = None
+    previous_event: str | None = None
+    previous_row_key: tuple[str, str] | None = None
+    previous_window: str | None = None
+    previous_checkpoint_sha256: str | None = None
+    for expected_index, entry in enumerate(entries, start=1):
+        if entry.name != f"{expected_index:08d}":
+            raise ValueError("Archive checkpoints must form one contiguous prefix")
+        actual_names = {child.name for child in entry.iterdir()}
+        if actual_names != {"checkpoint.json", "rows.jsonl"}:
+            raise ValueError("Archive checkpoint directory contains unexpected entries")
+        if (entry / "checkpoint.json").is_symlink() or not (
+            entry / "checkpoint.json"
+        ).is_file():
+            raise ValueError("Archive checkpoint metadata is not a regular file")
+        expected_archive = archive_inputs[expected_index - 1]
+        if not isinstance(expected_archive, dict):
+            raise ValueError("Archive checkpoint plan contains an invalid archive record")
+        record, report, previous_row_key, previous_window = validate_archive_checkpoint(
+            checkpoint_path=entry / "checkpoint.json",
+            chunk_path=entry / "rows.jsonl",
+            expected_plan=expected_plan,
+            expected_archive=expected_archive,
+            expected_index=expected_index,
+            expected_previous_id=previous_id,
+            expected_previous_event=previous_event,
+            expected_previous_checkpoint_sha256=previous_checkpoint_sha256,
+            previous_row_key=previous_row_key,
+            previous_window=previous_window,
+        )
+        next_state = record["nextState"]
+        if not isinstance(next_state, dict):
+            raise ValueError("Archive checkpoint next state is invalid")
+        previous_id = checkpoint_optional_string(next_state["lastTradeId"], "lastTradeId")
+        previous_event = checkpoint_optional_string(next_state["lastEventAt"], "lastEventAt")
+        previous_checkpoint_sha256 = checkpoint_optional_string(
+            record["checkpointSha256"], "checkpoint digest"
+        )
+        checkpoints.append((record, report, entry / "rows.jsonl"))
+    return checkpoints
+
+
+def prepare_archive_batch(
+    *,
+    archive_path: Path,
+    options: DatasetOptions,
+    history_tail: Sequence[Candle],
+    previous_day_last_id: str | None,
+    previous_day_last_event: datetime | None,
+) -> tuple[ArchiveReport, list[Candle], list[dict[str, object]]]:
+    report, candles = stream_archive_candles(
+        archive_path,
+        options,
+        previous_day_last_id=previous_day_last_id,
+        previous_day_last_event=previous_day_last_event,
+    )
+    report_day = date.fromisoformat(report.day)
+    expected_day_start = datetime(report_day.year, report_day.month, report_day.day, tzinfo=UTC)
+    if (
+        not candles
+        or candles[0].start != expected_day_start
+        or candles[-1].end != expected_day_start + timedelta(days=1)
+    ):
+        raise ValueError(f"Archive {report.archive} does not cover its complete aligned UTC day")
+    if report.missing_trade_id_count:
+        raise ValueError(
+            f"Detected {report.missing_trade_id_count} missing Binance trade IDs; "
+            "source corpus is quarantined"
+        )
+    sequence = list(history_tail) + candles
+    gaps: list[datetime] = []
+    duration_seconds = SIGNAL_DURATION_SECONDS[options.signal_type]
+    for previous, target in zip(sequence, sequence[1:]):
+        if previous.end == target.start:
+            continue
+        cursor = previous.end
+        while cursor < target.start:
+            gaps.append(cursor)
+            cursor += timedelta(seconds=duration_seconds)
+    if gaps:
+        raise ValueError(
+            f"Detected {len(gaps)} missing aligned candle windows; "
+            "quarantine and repair source coverage"
+        )
+    owned_window_starts = {format_timestamp(candle.start) for candle in candles}
+    rows = [
+        row
+        for row in examples_from_candles(sequence, options)
+        if str(row["windowStart"]) in owned_window_starts
+    ]
+    return report, candles, rows
+
+
+def write_archive_checkpoint(
+    *,
+    archives_root: Path,
+    expected_plan: dict[str, object],
+    archive_input: dict[str, object],
+    archive_index: int,
+    archive_count: int,
+    rows: Sequence[dict[str, object]],
+    report: ArchiveReport,
+    previous_id: str | None,
+    previous_event: str | None,
+    previous_checkpoint_sha256: str | None,
+    previous_row_key: tuple[str, str] | None,
+    previous_window: str | None,
+) -> dict[str, object]:
+    final_directory = archives_root / f"{archive_index:08d}"
+    if final_directory.exists():
+        raise FileExistsError(f"Refusing to overwrite archive checkpoint: {final_directory}")
+    temporary_directory = Path(
+        tempfile.mkdtemp(prefix=f".{archive_index:08d}.", suffix=".part", dir=archives_root)
+    )
+    try:
+        chunk_path = temporary_directory / "rows.jsonl"
+        digest = hashlib.sha256()
+        byte_count = 0
+        row_count = 0
+        window_count = 0
+        first_key: tuple[str, str] | None = None
+        last_key = previous_row_key
+        first_window: str | None = None
+        last_window = previous_window
+        last_window_end: str | None = None
+        with chunk_path.open("xb") as handle:
+            for row in rows:
+                key = str(row["decisionAt"]), str(row["id"])
+                if last_key is not None and key <= last_key:
+                    raise ValueError("Prepared rows must have unique monotonic IDs")
+                window = str(row["windowStart"])
+                if last_window is not None and window < last_window:
+                    raise ValueError("Prepared windows must be monotonic")
+                if window != last_window:
+                    window_count += 1
+                first_key = first_key or key
+                first_window = first_window or window
+                last_key = key
+                last_window = window
+                last_window_end = str(row["windowEnd"])
+                payload = (canonical_json(row) + "\n").encode("utf-8")
+                handle.write(payload)
+                digest.update(payload)
+                byte_count += len(payload)
+                row_count += 1
+            handle.flush()
+            os.fsync(handle.fileno())
+        record = {
+            "schemaVersion": ARCHIVE_PREPARATION_CHECKPOINT_SCHEMA_VERSION,
+            "planFingerprintSha256": expected_plan["fingerprintSha256"],
+            "previousCheckpointSha256": previous_checkpoint_sha256,
+            "archiveIndex": archive_index,
+            "archiveCount": archive_count,
+            "archiveInput": archive_input,
+            "previousState": {
+                "lastTradeId": previous_id,
+                "lastEventAt": previous_event,
+            },
+            "nextState": {
+                "lastTradeId": report.last_trade_id,
+                "lastEventAt": report.last_event_at,
+            },
+            "rows": {
+                "path": "rows.jsonl",
+                "bytes": byte_count,
+                "sha256": digest.hexdigest(),
+                "rowCount": row_count,
+                "windowCount": window_count,
+                "firstKey": list(first_key) if first_key is not None else None,
+                "lastKey": list(last_key) if row_count else None,
+                "firstWindow": first_window,
+                "lastWindow": last_window if row_count else None,
+                "lastWindowEnd": last_window_end,
+            },
+            "report": asdict(report),
+        }
+        record["checkpointSha256"] = checkpoint_identity_sha256(record)
+        write_new_json(temporary_directory / "checkpoint.json", record)
+        temporary_directory.rename(final_directory)
+        return record
+    except BaseException:
+        shutil.rmtree(temporary_directory, ignore_errors=True)
+        raise
+
+
+def iter_checkpoint_rows(
+    checkpoints: Sequence[tuple[dict[str, object], ArchiveReport, Path]],
+) -> Iterator[dict[str, object]]:
+    for record, _, chunk_path in checkpoints:
+        rows = record["rows"]
+        if not isinstance(rows, dict):
+            raise ValueError("Archive checkpoint rows are invalid")
+        expected_count = checkpoint_integer(rows["rowCount"], "row count")
+        observed_count = 0
+        with chunk_path.open("rb") as handle:
+            for line in handle:
+                if not line.endswith(b"\n"):
+                    raise ValueError("Archive checkpoint row chunks must end every row with LF")
+                try:
+                    row = json.loads(line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise ValueError("Archive checkpoint row chunk contains invalid JSON") from error
+                if not isinstance(row, dict) or (canonical_json(row) + "\n").encode("utf-8") != line:
+                    raise ValueError("Archive checkpoint row chunk is not canonically encoded")
+                observed_count += 1
+                yield row
+        if observed_count != expected_count:
+            raise ValueError("Archive checkpoint row count mismatch")
+
+
+def validate_published_output_against_checkpoints(
+    output: Path,
+    checkpoints: Sequence[tuple[dict[str, object], ArchiveReport, Path]],
+) -> None:
+    if output.is_symlink() or not output.is_file():
+        raise ValueError("Published prepared output is not a regular file")
+    expected_digest = hashlib.sha256()
+    observed_digest = hashlib.sha256()
+    expected_bytes = 0
+    with output.open("rb") as observed:
+        for _, _, chunk_path in checkpoints:
+            with chunk_path.open("rb") as expected:
+                for block in iter(lambda: expected.read(1_048_576), b""):
+                    observed_block = observed.read(len(block))
+                    expected_digest.update(block)
+                    observed_digest.update(observed_block)
+                    expected_bytes += len(block)
+                    if observed_block != block:
+                        raise ValueError(
+                            "Published prepared output does not match checkpoint bytes"
+                        )
+        if observed.read(1):
+            raise ValueError("Published prepared output has bytes beyond its checkpoints")
+    if (
+        output.stat().st_size != expected_bytes
+        or observed_digest.hexdigest() != expected_digest.hexdigest()
+    ):
+        raise ValueError("Published prepared output hash or size does not match checkpoints")
+
+
+def remove_abandoned_finalization_temporaries(
+    targets: Sequence[Path],
+    *,
+    checkpoint_root_was_present: bool,
+    checkpoints_complete: bool,
+) -> None:
+    candidates: list[Path] = []
+    for target in targets:
+        prefix = f".{target.name}."
+        pattern = re.compile(
+            rf"^\.{re.escape(target.name)}\."
+            rf"{CHECKPOINT_SAFE_TEMPORARY_TOKEN}\.part$"
+        )
+        target_candidates = [
+            entry
+            for entry in target.parent.iterdir()
+            if entry.name.startswith(prefix) and entry.name.endswith(".part")
+        ]
+        if len(target_candidates) > 1:
+            raise ValueError(f"Ambiguous abandoned temporary files for {target.name}")
+        for entry in target_candidates:
+            if pattern.fullmatch(entry.name) is None:
+                raise ValueError(f"Ambiguous abandoned temporary name: {entry.name}")
+            if entry.is_symlink() or not entry.is_file():
+                raise ValueError(f"Abandoned temporary is not a regular file: {entry.name}")
+            candidates.append(entry)
+    if candidates and (not checkpoint_root_was_present or not checkpoints_complete):
+        raise ValueError("Abandoned finalization temporaries lack complete checkpoints")
+    for candidate in candidates:
+        candidate.unlink()
+
+
+def validate_completed_dataset_manifest(
+    *,
+    output: Path,
+    manifest_output: Path,
+    checkpoints: Sequence[tuple[dict[str, object], ArchiveReport, Path]],
+    reports: Sequence[ArchiveReport],
+    options: DatasetOptions,
+    acquisition_manifest_path: Path | None,
+) -> dict[str, object]:
+    manifest, _ = read_json_object_and_sha256(manifest_output)
+    validate_dataset_manifest(manifest)
+    row_count = 0
+    window_count = 0
+    first_decision_at: str | None = None
+    last_window_end: str | None = None
+    for record, _, _ in checkpoints:
+        rows = record["rows"]
+        if not isinstance(rows, dict):
+            raise ValueError("Completed checkpoint row summary is invalid")
+        row_count += checkpoint_integer(rows["rowCount"], "row count")
+        window_count += checkpoint_integer(rows["windowCount"], "window count")
+        first_key = checkpoint_key(rows["firstKey"], "first row key")
+        if first_decision_at is None and first_key is not None:
+            first_decision_at = first_key[0]
+        checkpoint_last_end = checkpoint_optional_string(
+            rows["lastWindowEnd"], "last window end"
+        )
+        if checkpoint_last_end is not None:
+            last_window_end = checkpoint_last_end
+    model_fit_end = int(window_count * 0.6)
+    calibration_end = int(window_count * 0.8)
+    partition_window_counts = {
+        "modelFit": model_fit_end,
+        "calibration": calibration_end - model_fit_end,
+        "evaluation": window_count - calibration_end,
+    }
+    report_days = [date.fromisoformat(report.day) for report in reports]
+    source_start = report_days[0].isoformat() if report_days else None
+    source_end = (
+        (report_days[-1] + timedelta(days=1)).isoformat() if report_days else None
+    )
+    expected_acquisition = (
+        validate_acquisition_evidence(
+            acquisition_manifest_path,
+            reports,
+            source_start,
+            source_end,
+        )
+        if acquisition_manifest_path is not None
+        else None
+    )
+    source = manifest["source"]
+    if not isinstance(source, dict):
+        raise ValueError("Completed dataset manifest source is invalid")
+    expected_lineage = (
+        "PUBLIC_BINANCE_ARCHIVE"
+        if acquisition_manifest_path is not None
+        else "LOCAL_ARCHIVE_REPLAY"
+    )
+    source_bindings = {
+        "lineageKind": expected_lineage,
+        "startDateInclusive": source_start,
+        "endDateExclusive": source_end,
+        "dayCount": len(reports),
+        "acquisitionEvidence": expected_acquisition,
+        "archives": [asdict(report) for report in reports],
+    }
+    if any(source.get(key) != value for key, value in source_bindings.items()):
+        raise ValueError("Completed dataset manifest source binding mismatch")
+    output_sha256 = sha256_file(output)
+    expected_bindings = {
+        "target": target_contract_for_options(options),
+        "options": asdict(options),
+        "startAt": first_decision_at,
+        "endAt": last_window_end,
+        "acceptedTradeCount": sum(report.accepted_trade_count for report in reports),
+        "rejectedTradeCount": sum(report.rejected_trade_count for report in reports),
+        "gapCount": 0,
+        "gapWindowStarts": [],
+        "duplicateTradeCount": sum(report.duplicate_trade_count for report in reports),
+        "preparedDecisionRowCount": row_count,
+        "preparedWindowCount": window_count,
+        "windowCountUnit": "UNIQUE_WINDOW_START",
+        "partitionWindowCounts": partition_window_counts,
+        "preparedDatasetSha256": output_sha256,
+        "generator": runtime_metadata(),
+    }
+    if any(manifest.get(key) != value for key, value in expected_bindings.items()):
+        raise ValueError("Completed dataset manifest output binding mismatch")
+    return {
+        "rows": row_count,
+        "output": str(output.resolve()),
+        "manifest": str(manifest_output.resolve()),
+        "datasetContentSha256": output_sha256,
+        "gapCount": 0,
+        "rejectedTradeCount": expected_bindings["rejectedTradeCount"],
+        "duplicateTradeCount": expected_bindings["duplicateTradeCount"],
+    }
+
+
+def write_resumable_archive_dataset(
+    *,
+    archives: Sequence[Path],
+    output: Path,
+    manifest_output: Path,
+    options: DatasetOptions,
+    acquisition_manifest_path: Path | None,
+) -> dict[str, object]:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_root = archive_checkpoint_root(output)
+    checkpoint_root_was_present = checkpoint_root.exists()
+    output_exists = output.exists()
+    manifest_exists = manifest_output.exists()
+    reconciling_completed_outputs = output_exists and manifest_exists
+    recovering_published_output = output_exists and not manifest_exists
+    if manifest_exists and not output_exists:
+        raise FileExistsError(
+            f"Refusing dataset manifest without prepared output: {manifest_output}"
+        )
+    if (recovering_published_output or reconciling_completed_outputs) and not (
+        checkpoint_root.is_dir()
+    ):
+        raise FileExistsError(
+            f"Refusing completed or published dataset without checkpoints: {output}"
+        )
+    if reconciling_completed_outputs:
+        if output.is_symlink() or not output.is_file():
+            raise ValueError("Completed prepared output is not a regular file")
+        if manifest_output.is_symlink() or not manifest_output.is_file():
+            raise ValueError("Completed dataset manifest is not a regular file")
+        if checkpoint_root.is_symlink() or {
+            entry.name for entry in checkpoint_root.iterdir()
+        } != {"archives", "plan.json"}:
+            raise ValueError("Completed dataset checkpoint state is not normal")
+        if output.parent == manifest_output.parent and {
+            entry.name for entry in output.parent.iterdir()
+        } != {output.name, manifest_output.name, checkpoint_root.name}:
+            raise ValueError("Completed dataset directory contains unexpected entries")
+    expected_plan = build_archive_preparation_plan(
+        archives=archives,
+        output=output,
+        manifest_output=manifest_output,
+        options=options,
+        acquisition_manifest_path=acquisition_manifest_path,
+    )
+    archives_root = initialize_archive_checkpoint_store(checkpoint_root, expected_plan)
+    checkpoints = load_archive_checkpoints(
+        archives_root=archives_root,
+        expected_plan=expected_plan,
+    )
+    if (
+        recovering_published_output or reconciling_completed_outputs
+    ) and len(checkpoints) != len(archives):
+        raise ValueError(
+            "Published or completed output cannot use incomplete checkpoints"
+        )
+    inputs = expected_plan["inputs"]
+    if not isinstance(inputs, dict) or not isinstance(inputs.get("archives"), list):
+        raise ValueError("Archive checkpoint plan inputs are invalid")
+    archive_inputs = inputs["archives"]
+    reports = [report for _, report, _ in checkpoints]
+    history_tail: list[Candle] = []
+    previous_id: str | None = None
+    previous_event: str | None = None
+    previous_row_key: tuple[str, str] | None = None
+    previous_window: str | None = None
+    previous_checkpoint_sha256: str | None = None
+    if checkpoints:
+        last_record, expected_report, _ = checkpoints[-1]
+        previous_state = last_record["previousState"]
+        next_state = last_record["nextState"]
+        if not isinstance(previous_state, dict) or not isinstance(next_state, dict):
+            raise ValueError("Archive checkpoint state is invalid")
+        before_id = checkpoint_optional_string(previous_state["lastTradeId"], "lastTradeId")
+        before_event = checkpoint_optional_string(previous_state["lastEventAt"], "lastEventAt")
+        rebuilt_report, rebuilt_candles, _ = prepare_archive_batch(
+            archive_path=archives[len(checkpoints) - 1],
+            options=options,
+            history_tail=[],
+            previous_day_last_id=before_id,
+            previous_day_last_event=parse_timestamp(before_event) if before_event else None,
+        )
+        if asdict(rebuilt_report) != asdict(expected_report):
+            raise ValueError("Last archive checkpoint cannot reconstruct its source state")
+        if len(rebuilt_candles) < 13:
+            raise ValueError("Last archive checkpoint cannot reconstruct required feature history")
+        history_tail = rebuilt_candles[-13:]
+        previous_id = checkpoint_optional_string(next_state["lastTradeId"], "lastTradeId")
+        previous_event = checkpoint_optional_string(next_state["lastEventAt"], "lastEventAt")
+        previous_checkpoint_sha256 = checkpoint_optional_string(
+            last_record["checkpointSha256"], "checkpoint digest"
+        )
+        for record, _, _ in reversed(checkpoints):
+            row_summary = record["rows"]
+            if not isinstance(row_summary, dict):
+                raise ValueError("Archive checkpoint row summary is invalid")
+            key = checkpoint_key(row_summary["lastKey"], "last row key")
+            window = checkpoint_optional_string(row_summary["lastWindow"], "last window")
+            if previous_row_key is None and key is not None:
+                previous_row_key = key
+            if previous_window is None and window is not None:
+                previous_window = window
+            if previous_row_key is not None and previous_window is not None:
+                break
+        print(
+            f"Resuming after {len(checkpoints)}/{len(archives)} verified daily archives...",
+            file=sys.stderr,
+            flush=True,
+        )
+    for archive_index in range(len(checkpoints) + 1, len(archives) + 1):
+        archive_path = archives[archive_index - 1]
+        report, candles, rows = prepare_archive_batch(
+            archive_path=archive_path,
+            options=options,
+            history_tail=history_tail,
+            previous_day_last_id=previous_id,
+            previous_day_last_event=parse_timestamp(previous_event) if previous_event else None,
+        )
+        record = write_archive_checkpoint(
+            archives_root=archives_root,
+            expected_plan=expected_plan,
+            archive_input=archive_inputs[archive_index - 1],
+            archive_index=archive_index,
+            archive_count=len(archives),
+            rows=rows,
+            report=report,
+            previous_id=previous_id,
+            previous_event=previous_event,
+            previous_checkpoint_sha256=previous_checkpoint_sha256,
+            previous_row_key=previous_row_key,
+            previous_window=previous_window,
+        )
+        reports.append(report)
+        checkpoints.append((record, report, archives_root / f"{archive_index:08d}" / "rows.jsonl"))
+        history_tail = (history_tail + candles)[-13:]
+        previous_id = report.last_trade_id
+        previous_event = report.last_event_at
+        previous_checkpoint_sha256 = checkpoint_optional_string(
+            record["checkpointSha256"], "checkpoint digest"
+        )
+        row_summary = record["rows"]
+        if not isinstance(row_summary, dict):
+            raise ValueError("Archive checkpoint row summary is invalid")
+        new_key = checkpoint_key(row_summary["lastKey"], "last row key")
+        new_window = checkpoint_optional_string(row_summary["lastWindow"], "last window")
+        previous_row_key = new_key or previous_row_key
+        previous_window = new_window or previous_window
+        if archive_index % 25 == 0 or archive_index == len(archives):
+            print(
+                f"Prepared {archive_index}/{len(archives)} verified daily archives...",
+                file=sys.stderr,
+                flush=True,
+            )
+    final_plan = build_archive_preparation_plan(
+        archives=archives,
+        output=output,
+        manifest_output=manifest_output,
+        options=options,
+        acquisition_manifest_path=acquisition_manifest_path,
+    )
+    if final_plan != expected_plan:
+        raise ValueError("Archive preparation inputs changed before finalization")
+    if reconciling_completed_outputs:
+        validate_published_output_against_checkpoints(output, checkpoints)
+        existing_result = validate_completed_dataset_manifest(
+            output=output,
+            manifest_output=manifest_output,
+            checkpoints=checkpoints,
+            reports=reports,
+            options=options,
+            acquisition_manifest_path=acquisition_manifest_path,
+        )
+        return existing_result
+    if recovering_published_output:
+        validate_published_output_against_checkpoints(output, checkpoints)
+    remove_abandoned_finalization_temporaries(
+        (output, manifest_output),
+        checkpoint_root_was_present=checkpoint_root_was_present,
+        checkpoints_complete=len(checkpoints) == len(archives),
+    )
+    if recovering_published_output:
+        output.unlink()
+        print(
+            "Verified and removed an unpublished prepared output; replaying finalization...",
+            file=sys.stderr,
+            flush=True,
+        )
+    result = write_prepared_dataset(
+        rows=iter_checkpoint_rows(checkpoints),
         trades_accepted=None,
         cross_file_duplicates=0,
         reports=reports,
-        gap_starts=gap_starts,
+        gap_starts=[],
         output=output,
         manifest_output=manifest_output,
         options=options,
@@ -423,6 +1572,7 @@ def prepare_archives(
         ),
         acquisition_manifest_path=acquisition_manifest_path,
     )
+    return result
 
 
 def select_offline_archives(archive_root: Path, start: date, end: date) -> list[Path]:

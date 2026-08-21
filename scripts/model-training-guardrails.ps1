@@ -1,5 +1,172 @@
 Set-StrictMode -Version Latest
 
+function ConvertTo-WindowsNativeArgument {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)]
+    [AllowEmptyString()]
+    [string]$Value
+  )
+
+  if (($Value.Length -gt 0) -and ($Value -notmatch '[\s"]')) {
+    return $Value
+  }
+
+  $builder = [System.Text.StringBuilder]::new()
+  [void]$builder.Append('"')
+  $backslashCount = 0
+  foreach ($character in $Value.ToCharArray()) {
+    if ($character -eq '\') {
+      $backslashCount += 1
+      continue
+    }
+    if ($character -eq '"') {
+      if ($backslashCount -gt 0) {
+        [void]$builder.Append(('\' * ($backslashCount * 2)))
+      }
+      [void]$builder.Append('\"')
+      $backslashCount = 0
+      continue
+    }
+    if ($backslashCount -gt 0) {
+      [void]$builder.Append(('\' * $backslashCount))
+      $backslashCount = 0
+    }
+    [void]$builder.Append($character)
+  }
+  if ($backslashCount -gt 0) {
+    [void]$builder.Append(('\' * ($backslashCount * 2)))
+  }
+  [void]$builder.Append('"')
+  return $builder.ToString()
+}
+
+function Invoke-LoggedNativeProcess {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$FilePath,
+    [Parameter(Mandatory)]
+    [AllowEmptyCollection()]
+    [AllowEmptyString()]
+    [string[]]$ArgumentList,
+    [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$LogPath,
+    [ValidateNotNullOrEmpty()][string]$WorkingDirectory = (Get-Location).Path,
+    [switch]$Append
+  )
+
+  $workingPath = [System.IO.Path]::GetFullPath($WorkingDirectory)
+  if (-not [System.IO.Directory]::Exists($workingPath)) {
+    throw "Native process working directory does not exist: $workingPath"
+  }
+  $fullLogPath = [System.IO.Path]::GetFullPath($LogPath)
+  $logParent = [System.IO.Path]::GetDirectoryName($fullLogPath)
+  if ([string]::IsNullOrWhiteSpace($logParent) -or
+      -not [System.IO.Directory]::Exists($logParent)) {
+    throw "Native process log parent does not exist: $logParent"
+  }
+
+  $encodedArguments = @(
+    foreach ($argument in $ArgumentList) {
+      ConvertTo-WindowsNativeArgument -Value $argument
+    }
+  )
+  $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+  $startInfo.FileName = $FilePath
+  $startInfo.Arguments = [string]::Join(' ', [string[]]$encodedArguments)
+  $startInfo.WorkingDirectory = $workingPath
+  $startInfo.UseShellExecute = $false
+  $startInfo.CreateNoWindow = $true
+  $startInfo.RedirectStandardOutput = $true
+  $startInfo.RedirectStandardError = $true
+  $utf8 = [System.Text.UTF8Encoding]::new($false)
+  $startInfo.StandardOutputEncoding = $utf8
+  $startInfo.StandardErrorEncoding = $utf8
+
+  $fileMode = if ($Append) {
+    [System.IO.FileMode]::Append
+  } else {
+    [System.IO.FileMode]::CreateNew
+  }
+  $logStream = $null
+  $writer = $null
+  $process = $null
+  $processStarted = $false
+  try {
+    $logStream = [System.IO.File]::Open(
+      $fullLogPath,
+      $fileMode,
+      [System.IO.FileAccess]::Write,
+      [System.IO.FileShare]::Read
+    )
+    $writer = [System.IO.StreamWriter]::new($logStream, $utf8, 4096, $true)
+    $writer.AutoFlush = $true
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+      throw "Unable to start native process: $FilePath"
+    }
+    $processStarted = $true
+
+    $stdoutOpen = $true
+    $stderrOpen = $true
+    $stdoutTask = $process.StandardOutput.ReadLineAsync()
+    $stderrTask = $process.StandardError.ReadLineAsync()
+    while ($stdoutOpen -or $stderrOpen) {
+      $advanced = $false
+      if ($stdoutOpen -and $stdoutTask.IsCompleted) {
+        $line = $stdoutTask.GetAwaiter().GetResult()
+        if ($null -eq $line) {
+          $stdoutOpen = $false
+        } else {
+          $writer.WriteLine($line)
+          try { [Console]::Out.WriteLine($line) } catch { }
+          $stdoutTask = $process.StandardOutput.ReadLineAsync()
+        }
+        $advanced = $true
+      }
+      if ($stderrOpen -and $stderrTask.IsCompleted) {
+        $line = $stderrTask.GetAwaiter().GetResult()
+        if ($null -eq $line) {
+          $stderrOpen = $false
+        } else {
+          $writer.WriteLine($line)
+          try { [Console]::Error.WriteLine($line) } catch { }
+          $stderrTask = $process.StandardError.ReadLineAsync()
+        }
+        $advanced = $true
+      }
+      if (-not $advanced) {
+        [System.Threading.Thread]::Sleep(10)
+      }
+    }
+
+    $process.WaitForExit()
+    $exitCode = [int]$process.ExitCode
+    if ($exitCode -ne 0) {
+      $footer = '[flippars-native-exit] exitCode={0}' -f `
+        $exitCode.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+      $writer.WriteLine($footer)
+      try { [Console]::Error.WriteLine($footer) } catch { }
+    }
+    $writer.Flush()
+    $logStream.Flush($true)
+    return $exitCode
+  } finally {
+    if ($processStarted) {
+      $shouldStop = $false
+      try { $shouldStop = -not $process.HasExited } catch { }
+      if ($shouldStop) {
+        try { $process.Kill() } catch { }
+        try { $process.WaitForExit() } catch { }
+      }
+    }
+    if ($null -ne $writer) { try { $writer.Dispose() } catch { } }
+    if ($null -ne $logStream) { try { $logStream.Dispose() } catch { } }
+    if ($null -ne $process) { try { $process.Dispose() } catch { } }
+  }
+}
+
 function ConvertTo-NormalizedFullPath {
   [CmdletBinding()]
   param([Parameter(Mandatory)][string]$Path)

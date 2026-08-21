@@ -15,7 +15,8 @@ param(
   [ValidateRange(0.5, 1.0)][double]$ConfidenceThreshold = 0.75,
   [ValidateRange(90, 365)][int]$ValidityDays = 120,
   [ValidateSet('Exploration', 'FrozenDraft')]
-  [string]$Mode = 'FrozenDraft'
+  [string]$Mode = 'FrozenDraft',
+  [switch]$Resume
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,8 +26,340 @@ if (Test-Path -LiteralPath 'variable:PSNativeCommandUseErrorActionPreference') {
 }
 $env:PYTHON_BASIC_REPL = '1'
 $env:PYTHONDONTWRITEBYTECODE = '1'
+$env:PYTHONUNBUFFERED = '1'
+$env:PYTHONIOENCODING = 'utf-8'
 
 . (Join-Path $PSScriptRoot 'model-training-guardrails.ps1')
+
+function Get-ModelTrainingRunStartState {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][string]$ProcessedRoot,
+    [Parameter(Mandatory)][string]$ArtifactRoot,
+    [Parameter(Mandatory)][string]$EvidenceRoot,
+    [Parameter(Mandatory)][string]$PreparedPath,
+    [Parameter(Mandatory)][string]$DatasetManifestPath,
+    [Parameter(Mandatory)][string]$CheckpointRoot,
+    [Parameter(Mandatory)][string]$CommandLogPath,
+    [switch]$Resume
+  )
+
+  if (-not $Resume) {
+    foreach ($root in @($ProcessedRoot, $ArtifactRoot, $EvidenceRoot)) {
+      if (Test-Path -LiteralPath $root) {
+        throw "Run output already exists; use a new model version instead of overwriting evidence: $root"
+      }
+    }
+    return [pscustomobject][ordered]@{
+      Kind = 'Fresh'
+      SkipPreparation = $false
+      AppendFirstChild = $false
+    }
+  }
+
+  if (Test-Path -LiteralPath $ArtifactRoot) {
+    throw "Resume requires the artifact root to be absent: $ArtifactRoot"
+  }
+
+  foreach ($requiredDirectory in @(
+    [pscustomobject]@{ Path = $ProcessedRoot; Label = 'processed root' }
+    [pscustomobject]@{ Path = $EvidenceRoot; Label = 'evidence root' }
+  )) {
+    if (-not (Test-Path -LiteralPath $requiredDirectory.Path -PathType Container)) {
+      throw "Resume requires an existing real $($requiredDirectory.Label): $($requiredDirectory.Path)"
+    }
+    $item = Get-Item -LiteralPath $requiredDirectory.Path -Force
+    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+      throw "Resume rejects a reparse-point $($requiredDirectory.Label): $($requiredDirectory.Path)"
+    }
+  }
+
+  $evidenceEntries = @(Get-ChildItem -LiteralPath $EvidenceRoot -Force)
+  $commandLogName = [System.IO.Path]::GetFileName($CommandLogPath)
+  if (($evidenceEntries.Count -ne 1) -or
+      ([string]$evidenceEntries[0].Name -cne $commandLogName)) {
+    throw 'Resume evidence root must contain only training-command-output.log.'
+  }
+  $commandLog = $evidenceEntries[0]
+  if ($commandLog.PSIsContainer -or
+      (($commandLog.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) -or
+      ([long]$commandLog.Length -le 0)) {
+    throw 'Resume requires a nonempty regular training-command-output.log.'
+  }
+
+  $processedEntries = @(Get-ChildItem -LiteralPath $ProcessedRoot -Force)
+  $checkpointName = [System.IO.Path]::GetFileName($CheckpointRoot)
+  $checkpointMatches = @(
+    $processedEntries | Where-Object { [string]$_.Name -ceq $checkpointName }
+  )
+  if ($checkpointMatches.Count -eq 1) {
+    $checkpoint = $checkpointMatches[0]
+    if (-not $checkpoint.PSIsContainer -or
+        (($checkpoint.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
+      throw 'Resume archive checkpoint store must be a real directory.'
+    }
+    $preparedName = [System.IO.Path]::GetFileName($PreparedPath)
+    $manifestName = [System.IO.Path]::GetFileName($DatasetManifestPath)
+    $preparedTempPattern = '^\.' +
+      [regex]::Escape($preparedName) +
+      '\.[A-Za-z0-9_-]{8}\.part$'
+    $manifestTempPattern = '^\.' +
+      [regex]::Escape($manifestName) +
+      '\.[A-Za-z0-9_-]{8}\.part$'
+    $planTempPattern = '^\.plan\.json\.[A-Za-z0-9_-]{8}\.part$'
+    $checkpointEntries = @(
+      Get-ChildItem -LiteralPath $CheckpointRoot -Force |
+        Sort-Object -Property Name -CaseSensitive
+    )
+    if ($checkpointEntries.Count -eq 0) {
+      if ($processedEntries.Count -ne 1) {
+        throw 'Resume rejects sibling content beside an empty checkpoint store.'
+      }
+      return [pscustomobject][ordered]@{
+        Kind = 'ArchivePreparation'
+        SkipPreparation = $false
+        AppendFirstChild = $true
+      }
+    }
+    $archivesMatches = @(
+      $checkpointEntries | Where-Object { [string]$_.Name -ceq 'archives' }
+    )
+    $planMatches = @(
+      $checkpointEntries | Where-Object { [string]$_.Name -ceq 'plan.json' }
+    )
+    $planTemporaryMatches = @(
+      $checkpointEntries | Where-Object { [string]$_.Name -cmatch $planTempPattern }
+    )
+    if ($archivesMatches.Count -ne 1) {
+      throw 'Resume archive checkpoint store requires exactly one archives directory.'
+    }
+    $archivesDirectory = $archivesMatches[0]
+    if (-not $archivesDirectory.PSIsContainer -or
+        (($archivesDirectory.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
+      throw 'Resume archive checkpoint store requires a real archives directory.'
+    }
+    $archiveCheckpoints = @(Get-ChildItem -LiteralPath $archivesDirectory.FullName -Force)
+    if (($checkpointEntries.Count -eq 1) -and ($archiveCheckpoints.Count -eq 0)) {
+      if ($processedEntries.Count -ne 1) {
+        throw 'Resume rejects sibling content beside an initial archives-only checkpoint store.'
+      }
+      return [pscustomobject][ordered]@{
+        Kind = 'ArchivePreparation'
+        SkipPreparation = $false
+        AppendFirstChild = $true
+      }
+    }
+    $isInitialPlanPublication = (
+      ($checkpointEntries.Count -eq 2) -and
+      ($planMatches.Count -eq 0) -and
+      ($planTemporaryMatches.Count -eq 1)
+    )
+    if ($isInitialPlanPublication) {
+      $planTemporary = $planTemporaryMatches[0]
+      if (($processedEntries.Count -ne 1) -or
+          $planTemporary.PSIsContainer -or
+          (($planTemporary.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) -or
+          ($archiveCheckpoints.Count -ne 0)) {
+        throw 'Resume rejects an ambiguous initial checkpoint-plan publication state.'
+      }
+      return [pscustomobject][ordered]@{
+        Kind = 'ArchivePreparation'
+        SkipPreparation = $false
+        AppendFirstChild = $true
+      }
+    }
+    if (($checkpointEntries.Count -ne 2) -or
+        ($planMatches.Count -ne 1) -or
+        ($planTemporaryMatches.Count -ne 0)) {
+      throw 'Resume archive checkpoint store must contain only archives and plan.json.'
+    }
+    $planFile = $planMatches[0]
+    if ($planFile.PSIsContainer -or
+        (($planFile.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) -or
+        ([long]$planFile.Length -le 0)) {
+      throw 'Resume archive checkpoint store has an invalid plan file.'
+    }
+    $publishedPrepared = @(
+      $processedEntries | Where-Object { [string]$_.Name -ceq $preparedName }
+    )
+    $publishedManifest = @(
+      $processedEntries | Where-Object { [string]$_.Name -ceq $manifestName }
+    )
+    if ($publishedPrepared.Count -gt 1 -or $publishedManifest.Count -gt 1) {
+      throw 'Resume checkpoint state has an invalid published dataset state.'
+    }
+    $hasPublishedPair = (
+      ($publishedPrepared.Count -eq 1) -and
+      ($publishedManifest.Count -eq 1)
+    )
+    if ($publishedManifest.Count -eq 1 -and -not $hasPublishedPair) {
+      throw 'Resume checkpoint state cannot contain a manifest without its dataset.'
+    }
+    if ($hasPublishedPair) {
+      if ($processedEntries.Count -ne 3) {
+        throw 'Resume completed-output reconciliation rejects sibling content.'
+      }
+      foreach ($publishedEntry in @($publishedPrepared[0], $publishedManifest[0])) {
+        if ($publishedEntry.PSIsContainer -or
+            (($publishedEntry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) -or
+            ([long]$publishedEntry.Length -le 0)) {
+          throw 'Resume completed-output reconciliation requires nonempty regular files.'
+        }
+      }
+      return [pscustomobject][ordered]@{
+        Kind = 'ArchivePreparation'
+        SkipPreparation = $false
+        AppendFirstChild = $true
+      }
+    }
+    if ($publishedPrepared.Count -eq 1) {
+      $publishedPreparedEntry = $publishedPrepared[0]
+      if ($publishedPreparedEntry.PSIsContainer -or
+          (($publishedPreparedEntry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) -or
+          ([long]$publishedPreparedEntry.Length -le 0)) {
+        throw 'Resume checkpoint state requires a nonempty regular published dataset.'
+      }
+    }
+    foreach ($temporaryEntry in @(
+      $processedEntries | Where-Object {
+        ([string]$_.Name -cne $checkpointName) -and
+        ([string]$_.Name -cne $preparedName)
+      }
+    )) {
+      if ($temporaryEntry.PSIsContainer -or
+          (($temporaryEntry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) -or
+          (([string]$temporaryEntry.Name -cnotmatch $preparedTempPattern) -and
+           ([string]$temporaryEntry.Name -cnotmatch $manifestTempPattern))) {
+        throw 'Resume checkpoint state contains unexpected preparation debris.'
+      }
+    }
+    return [pscustomobject][ordered]@{
+      Kind = 'ArchivePreparation'
+      SkipPreparation = $false
+      AppendFirstChild = $true
+    }
+  }
+
+  $expectedPreparedNames = @(
+    [System.IO.Path]::GetFileName($DatasetManifestPath),
+    [System.IO.Path]::GetFileName($PreparedPath)
+  ) | Sort-Object -CaseSensitive
+  $actualPreparedNames = @(
+    $processedEntries | ForEach-Object { [string]$_.Name } | Sort-Object -CaseSensitive
+  )
+  if (($actualPreparedNames.Count -ne 2) -or
+      (($actualPreparedNames -join "`n") -cne ($expectedPreparedNames -join "`n"))) {
+    throw 'Resume processed root must contain only a checkpoint store or the prepared dataset pair.'
+  }
+  foreach ($preparedEntry in $processedEntries) {
+    if ($preparedEntry.PSIsContainer -or
+        (($preparedEntry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) -or
+        ([long]$preparedEntry.Length -le 0)) {
+      throw 'Resume requires nonempty regular prepared dataset files.'
+    }
+  }
+  return [pscustomobject][ordered]@{
+    Kind = 'PreparedDataset'
+    SkipPreparation = $true
+    AppendFirstChild = $true
+  }
+}
+
+function Write-ModelTrainingResumeSessionMarker {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][string]$LogPath,
+    [Parameter(Mandatory)][ValidateSet('ArchivePreparation', 'PreparedDataset')]
+    [string]$State,
+    [Parameter(Mandatory)][string]$Version
+  )
+
+  if (-not (Test-Path -LiteralPath $LogPath -PathType Leaf)) {
+    throw "Resume session log is missing: $LogPath"
+  }
+  $marker = '[flippars-resume-session] startedAt={0} state={1} version={2}' -f `
+    [datetime]::UtcNow.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture),
+    $State,
+    $Version
+  $encoding = [System.Text.UTF8Encoding]::new($false)
+  $payload = $encoding.GetBytes(
+    [Environment]::NewLine + $marker + [Environment]::NewLine
+  )
+  $stream = $null
+  try {
+    $stream = [System.IO.File]::Open(
+      $LogPath,
+      [System.IO.FileMode]::Append,
+      [System.IO.FileAccess]::Write,
+      [System.IO.FileShare]::Read
+    )
+    $stream.Write($payload, 0, $payload.Length)
+    $stream.Flush($true)
+  } finally {
+    if ($null -ne $stream) { $stream.Dispose() }
+  }
+  Write-Host $marker -ForegroundColor DarkCyan
+}
+
+function Remove-CompletedArchiveCheckpointStore {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][string]$ProcessedRoot,
+    [Parameter(Mandatory)][string]$CheckpointRoot
+  )
+
+  try {
+    $normalizedProcessedRoot = ConvertTo-NormalizedFullPath $ProcessedRoot
+    $normalizedCheckpointRoot = ConvertTo-NormalizedFullPath $CheckpointRoot
+    $expectedCheckpointRoot = ConvertTo-NormalizedFullPath (
+      Join-Path $normalizedProcessedRoot '.prepared.jsonl.archive-checkpoints'
+    )
+    if (-not [string]::Equals(
+      $normalizedCheckpointRoot,
+      $expectedCheckpointRoot,
+      [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+      throw 'Checkpoint cleanup target is not the exact governed checkpoint child.'
+    }
+    if (-not (Test-Path -LiteralPath $normalizedProcessedRoot -PathType Container)) {
+      throw 'Checkpoint cleanup processed root is not a directory.'
+    }
+    $processedItem = Get-Item -LiteralPath $normalizedProcessedRoot -Force
+    if (($processedItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+      throw 'Checkpoint cleanup refuses a reparse-point processed root.'
+    }
+    if (-not (Test-Path -LiteralPath $normalizedCheckpointRoot)) {
+      return $false
+    }
+    $checkpointItem = Get-Item -LiteralPath $normalizedCheckpointRoot -Force
+    if (-not $checkpointItem.PSIsContainer -or
+        (($checkpointItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
+      throw 'Checkpoint cleanup target must be a real directory.'
+    }
+    $directoriesToInspect = [System.Collections.Generic.Stack[string]]::new()
+    $directoriesToInspect.Push($normalizedCheckpointRoot)
+    while ($directoriesToInspect.Count -gt 0) {
+      $directoryToInspect = $directoriesToInspect.Pop()
+      foreach ($descendant in @(Get-ChildItem -LiteralPath $directoryToInspect -Force)) {
+        if (($descendant.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+          throw 'Checkpoint cleanup refuses a store containing a reparse point.'
+        }
+        if ($descendant.PSIsContainer) {
+          $directoriesToInspect.Push($descendant.FullName)
+        }
+      }
+    }
+    Remove-Item -LiteralPath $normalizedCheckpointRoot -Recurse -Force -ErrorAction Stop
+    Write-Host 'Removed completed archive-preparation checkpoints.' -ForegroundColor DarkGray
+    return $true
+  } catch {
+    Write-Warning (
+      'The COMPLETE run manifest is durable, but checkpoint cleanup was not completed: {0}' -f `
+        $_.Exception.Message
+    )
+    return $false
+  }
+}
 
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $trainingPath = Assert-ExternalTrainingRoot $TrainingRoot $repositoryRoot
@@ -72,19 +405,23 @@ $runEvidenceRoot = Assert-PathWithinTrainingRoot `
   (Join-Path $trainingPath "evidence\runs\$runKey") `
   $trainingPath
 
-foreach ($newRoot in @($processedRoot, $artifactRoot, $runEvidenceRoot)) {
-  if (Test-Path -LiteralPath $newRoot) {
-    throw "Run output already exists; use a new model version instead of overwriting evidence: $newRoot"
-  }
-}
-
 $preparedPath = Join-Path $processedRoot 'prepared.jsonl'
 $datasetManifestPath = Join-Path $processedRoot 'dataset-manifest.json'
+$archiveCheckpointRoot = Join-Path $processedRoot '.prepared.jsonl.archive-checkpoints'
 $artifactPath = Join-Path $artifactRoot 'candidate.json'
 $evaluationPath = Join-Path $artifactRoot 'evaluation.json'
 $cliOutputPath = Join-Path $runEvidenceRoot 'training-command-output.log'
 $crossRuntimeOutputPath = Join-Path $runEvidenceRoot 'cross-runtime-verification.log'
 $runManifestPath = Join-Path $runEvidenceRoot 'run-manifest.json'
+$runStartState = Get-ModelTrainingRunStartState `
+  -ProcessedRoot $processedRoot `
+  -ArtifactRoot $artifactRoot `
+  -EvidenceRoot $runEvidenceRoot `
+  -PreparedPath $preparedPath `
+  -DatasetManifestPath $datasetManifestPath `
+  -CheckpointRoot $archiveCheckpointRoot `
+  -CommandLogPath $cliOutputPath `
+  -Resume:$Resume
 
 Assert-NoTrackedTrainingMaterial $repositoryRoot
 & node (Join-Path $repositoryRoot 'scripts\check-repository.mjs')
@@ -223,51 +560,72 @@ $recordedIntegrityHash = (Get-FileHash -LiteralPath $datasetIntegrityPath -Algor
 if ($recordedIntegrityHash -ne ([string]$acquisitionManifest.isolatedIntegrity.Sha256).ToLowerInvariant()) {
   throw 'Dataset integrity evidence digest no longer matches acquisition evidence.'
 }
+$acquisitionManifestSha256 = (
+  Get-FileHash -LiteralPath $acquisitionManifestPath -Algorithm SHA256
+).Hash.ToLowerInvariant()
 
 & $pythonPath -m pip --isolated check
 if ($LASTEXITCODE -ne 0) { throw 'Training environment dependency check failed.' }
 
-New-Item -ItemType Directory -Path $runEvidenceRoot | Out-Null
+if ($runStartState.Kind -eq 'Fresh') {
+  New-Item -ItemType Directory -Path $runEvidenceRoot | Out-Null
+}
 
 $sourceRoot = Join-Path $repositoryRoot 'apps\model-training\src'
 $previousPythonPath = $env:PYTHONPATH
 $env:PYTHONPATH = $sourceRoot
 try {
-  Write-Host 'Preparing verified archives through the network-free streamed path...'
-  $pipelineErrorActionPreference = $ErrorActionPreference
-  try {
-    $ErrorActionPreference = 'Continue'
-    & $pythonPath -m flippars_model_training prepare-archives `
-      --archive-root $archiveRoot `
-      --start $Start `
-      --end $End `
-      --output $preparedPath `
-      --manifest-output $datasetManifestPath `
-      --acquisition-manifest $acquisitionManifestPath `
-      --signal-type $SignalType `
-      --deadband-bps $deadbandBps `
-      --timeframe-minutes $timeframeMinutes `
-      --decision-cadence-seconds $decisionCadenceSeconds `
-      --minimum-lead-time-seconds $minimumLeadTimeSeconds 2>&1 | `
-      Tee-Object -FilePath $cliOutputPath -ErrorAction Stop
-    $prepareExitCode = $LASTEXITCODE
-  } finally {
-    $ErrorActionPreference = $pipelineErrorActionPreference
-  }
-  if ($prepareExitCode -ne 0) {
-    throw "Offline dataset preparation failed with exit code $prepareExitCode."
+  if (-not $runStartState.SkipPreparation) {
+    Write-Host 'Preparing verified archives through the network-free streamed path...'
+    if ($runStartState.Kind -eq 'ArchivePreparation') {
+      Write-ModelTrainingResumeSessionMarker `
+        -LogPath $cliOutputPath `
+        -State $runStartState.Kind `
+        -Version $safeVersion
+    }
+    $prepareExitCode = Invoke-LoggedNativeProcess `
+      -FilePath $pythonPath `
+      -ArgumentList @(
+        '-m', 'flippars_model_training', 'prepare-archives',
+        '--archive-root', $archiveRoot,
+        '--start', $Start,
+        '--end', $End,
+        '--output', $preparedPath,
+        '--manifest-output', $datasetManifestPath,
+        '--acquisition-manifest', $acquisitionManifestPath,
+        '--signal-type', $SignalType,
+        '--deadband-bps', $deadbandBps,
+        '--timeframe-minutes', $timeframeMinutes,
+        '--decision-cadence-seconds', $decisionCadenceSeconds,
+        '--minimum-lead-time-seconds', $minimumLeadTimeSeconds
+      ) `
+      -LogPath $cliOutputPath `
+      -WorkingDirectory $repositoryRoot `
+      -Append:$runStartState.AppendFirstChild
+    if ($prepareExitCode -ne 0) {
+      throw "Offline dataset preparation failed with exit code $prepareExitCode."
+    }
+  } else {
+    Write-Host 'Reusing the complete prepared dataset pair after strict resume admission.'
   }
   $preparedManifest = Get-Content -LiteralPath $datasetManifestPath -Raw | ConvertFrom-Json
-  $acquisitionManifestSha256 = (
-    Get-FileHash -LiteralPath $acquisitionManifestPath -Algorithm SHA256
-  ).Hash.ToLowerInvariant()
   if (($preparedManifest.schemaVersion -ne 'flippars.dataset-manifest/2') -or
+      ($preparedManifest.symbol -ne 'BTCUSDT') -or
       ($preparedManifest.source.lineageKind -ne 'PUBLIC_BINANCE_ARCHIVE') -or
+      ($preparedManifest.source.startDateInclusive -ne $Start) -or
+      ($preparedManifest.source.endDateExclusive -ne $End) -or
+      ([int]$preparedManifest.source.dayCount -ne $requestedFiles) -or
       (-not [bool]$preparedManifest.source.acquisitionEvidence.freshOfficialTransportEvidence) -or
       (([string]$preparedManifest.source.acquisitionEvidence.acquisitionManifestSha256).ToLowerInvariant() -ne
        $acquisitionManifestSha256) -or
       (([string]$preparedManifest.source.acquisitionEvidence.acquisitionArchiveIndexSha256).ToLowerInvariant() -ne
-       ([string]$acquisitionManifest.acquisitionArchiveIndexSha256).ToLowerInvariant())) {
+       ([string]$acquisitionManifest.acquisitionArchiveIndexSha256).ToLowerInvariant()) -or
+      ($preparedManifest.target.signalType -ne $SignalType) -or
+      ([double]$preparedManifest.target.deadbandBps -ne $deadbandBps) -or
+      ([int]$preparedManifest.target.durationSeconds -ne ($timeframeMinutes * 60)) -or
+      ([int]$preparedManifest.target.candidateSchedule.cadenceSeconds -ne $decisionCadenceSeconds) -or
+      ([int]$preparedManifest.target.candidateSchedule.minimumLeadTimeSeconds -ne
+       $minimumLeadTimeSeconds)) {
     throw 'Prepared dataset does not bind the governed public Binance acquisition evidence.'
   }
   $preparedArchives = @($preparedManifest.source.archives)
@@ -292,26 +650,30 @@ try {
       throw "Prepared archive verification disagrees with acquisition evidence at index $index."
     }
   }
-
   Write-Host 'Fitting, calibrating, and evaluating the offline DRAFT candidate...'
-  $pipelineErrorActionPreference = $ErrorActionPreference
-  try {
-    $ErrorActionPreference = 'Continue'
-    & $pythonPath -m flippars_model_training train `
-      --input $preparedPath `
-      --manifest $datasetManifestPath `
-      --output $artifactPath `
-      --evaluation-output $evaluationPath `
-      --signal-type $SignalType `
-      --version $safeVersion `
-      --deadband-bps $deadbandBps `
-      --confidence-threshold $ConfidenceThreshold `
-      --validity-days $ValidityDays 2>&1 | `
-      Tee-Object -FilePath $cliOutputPath -Append -ErrorAction Stop
-    $trainExitCode = $LASTEXITCODE
-  } finally {
-    $ErrorActionPreference = $pipelineErrorActionPreference
+  if ($runStartState.Kind -eq 'PreparedDataset') {
+    Write-ModelTrainingResumeSessionMarker `
+      -LogPath $cliOutputPath `
+      -State $runStartState.Kind `
+      -Version $safeVersion
   }
+  $trainExitCode = Invoke-LoggedNativeProcess `
+    -FilePath $pythonPath `
+    -ArgumentList @(
+      '-m', 'flippars_model_training', 'train',
+      '--input', $preparedPath,
+      '--manifest', $datasetManifestPath,
+      '--output', $artifactPath,
+      '--evaluation-output', $evaluationPath,
+      '--signal-type', $SignalType,
+      '--version', $safeVersion,
+      '--deadband-bps', $deadbandBps,
+      '--confidence-threshold', $ConfidenceThreshold,
+      '--validity-days', $ValidityDays
+    ) `
+    -LogPath $cliOutputPath `
+    -WorkingDirectory $repositoryRoot `
+    -Append
   if ($trainExitCode -ne 0) {
     throw "Draft training command failed with exit code $trainExitCode."
   }
@@ -397,21 +759,19 @@ foreach ($verifierInput in @(
   }
 }
 Write-Host 'Running strict Python-to-TypeScript lineage verification...'
-$verifierErrorActionPreference = $ErrorActionPreference
-try {
-  $ErrorActionPreference = 'Continue'
-  & node $crossRuntimeVerifier `
-    --artifact $artifactPath `
-    --dataset-manifest $datasetManifestPath `
-    --evaluation $evaluationPath `
-    --pipeline $pipelinePath `
-    --prepared $preparedPath `
-    --acquisition-manifest $acquisitionManifestPath 2>&1 | `
-    Tee-Object -FilePath $crossRuntimeOutputPath -ErrorAction Stop
-  $crossRuntimeExitCode = $LASTEXITCODE
-} finally {
-  $ErrorActionPreference = $verifierErrorActionPreference
-}
+$crossRuntimeExitCode = Invoke-LoggedNativeProcess `
+  -FilePath 'node' `
+  -ArgumentList @(
+    $crossRuntimeVerifier,
+    '--artifact', $artifactPath,
+    '--dataset-manifest', $datasetManifestPath,
+    '--evaluation', $evaluationPath,
+    '--pipeline', $pipelinePath,
+    '--prepared', $preparedPath,
+    '--acquisition-manifest', $acquisitionManifestPath
+  ) `
+  -LogPath $crossRuntimeOutputPath `
+  -WorkingDirectory $repositoryRoot
 if ($crossRuntimeExitCode -ne 0) {
   throw "Strict cross-runtime lineage verification failed with exit code $crossRuntimeExitCode."
 }
@@ -480,6 +840,9 @@ $runManifest = [ordered]@{
   )
 }
 Write-JsonEvidenceAtomic -Path $runManifestPath -Value $runManifest -Depth 12
+[void](Remove-CompletedArchiveCheckpointStore `
+  -ProcessedRoot $processedRoot `
+  -CheckpointRoot $archiveCheckpointRoot)
 
 Write-Host "Frozen DRAFT artifact: $artifactPath"
 Write-Host "Evaluation: $evaluationPath"

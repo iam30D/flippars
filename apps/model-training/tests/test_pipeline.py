@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 import numpy as np
+import flippars_model_training.pipeline as pipeline_module
 
 from flippars_model_training.pipeline import (
     CLASS_ORDER,
@@ -36,6 +37,7 @@ from flippars_model_training.pipeline import (
     examples_from_trades,
     fit_multinomial,
     format_timestamp,
+    iter_archive_rows,
     iter_training_window_groups,
     multinomial_objective,
     multinomial_objective_and_gradient,
@@ -46,6 +48,7 @@ from flippars_model_training.pipeline import (
     parse_timestamp,
     parse_trade_row,
     policy_digest,
+    prepare_archives,
     pre_evaluation_sampling_contract,
     replay_policy,
     select_offline_archives,
@@ -404,6 +407,451 @@ class ArchiveTests(unittest.TestCase):
             (root / "unexpected.txt").write_text("x", encoding="utf-8")
             with self.assertRaises(ValueError):
                 select_offline_archives(root, date(2025, 1, 1), date(2025, 1, 3))
+
+
+class ResumableArchivePreparationTests(unittest.TestCase):
+    def build_daily_archives(self, root: Path, day_count: int = 3) -> list[Path]:
+        root.mkdir(parents=True, exist_ok=True)
+        start = datetime(2025, 1, 1, tzinfo=UTC)
+        trade_id = 1
+        paths: list[Path] = []
+        for day_index in range(day_count):
+            day_start = start + timedelta(days=day_index)
+            day_text = day_start.date().isoformat()
+            archive_path = root / f"BTCUSDT-trades-{day_text}.zip"
+            member_name = f"BTCUSDT-trades-{day_text}.csv"
+            lines = ["id,price,qty,quoteQty,time,isBuyerMaker,isBestMatch\n"]
+            for candle_index in range(288):
+                event_time = day_start + timedelta(minutes=5 * candle_index)
+                price = 50_000 + day_index * 100 + (candle_index % 17) - 8
+                quantity = 0.1 + (candle_index % 3) * 0.01
+                quote_quantity = price * quantity
+                timestamp = int(event_time.timestamp() * 1_000_000)
+                maker = "true" if trade_id % 2 == 0 else "false"
+                lines.append(
+                    f"{trade_id},{price},{quantity},{quote_quantity},"
+                    f"{timestamp},{maker},true\n"
+                )
+                trade_id += 1
+            with zipfile.ZipFile(
+                archive_path, "w", compression=zipfile.ZIP_DEFLATED
+            ) as archive:
+                archive.writestr(member_name, "".join(lines))
+            digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+            archive_path.with_suffix(".zip.CHECKSUM").write_text(
+                f"{digest}  {archive_path.name}\n", encoding="utf-8"
+            )
+            paths.append(archive_path)
+        return paths
+
+    def prepare_arguments(
+        self,
+        archives: list[Path],
+        output: Path,
+        manifest: Path,
+        acquisition_manifest: Path | None = None,
+        signal_type: str = "FIVE_MINUTE_EARLY_DIRECTION",
+    ) -> dict[str, object]:
+        signal_options = options(signal_type)
+        return {
+            "archives": archives,
+            "output": output,
+            "manifest_output": manifest,
+            "signal_type": signal_type,
+            "deadband_bps": DEFAULT_DEADBAND_BPS,
+            "timeframe_minutes": signal_options.timeframe_minutes,
+            "decision_cadence_seconds": signal_options.decision_cadence_seconds,
+            "minimum_lead_time_seconds": signal_options.minimum_lead_time_seconds,
+            "acquisition_manifest_path": acquisition_manifest,
+        }
+
+    def write_reference(
+        self,
+        archives: list[Path],
+        output: Path,
+        manifest: Path,
+        signal_type: str = "FIVE_MINUTE_EARLY_DIRECTION",
+    ) -> dict[str, object]:
+        reports: list[ArchiveReport] = []
+        gaps: list[datetime] = []
+        signal_options = options(signal_type)
+        return write_prepared_dataset(
+            rows=iter_archive_rows(
+                archives,
+                signal_options,
+                reports,
+                gaps,
+            ),
+            trades_accepted=None,
+            cross_file_duplicates=0,
+            reports=reports,
+            gap_starts=gaps,
+            output=output,
+            manifest_output=manifest,
+            options=signal_options,
+            lineage_kind="LOCAL_ARCHIVE_REPLAY",
+        )
+
+    def interrupt_after_checkpoint(self, archive_index: int):
+        original = pipeline_module.write_archive_checkpoint
+
+        def wrapped(**kwargs):
+            record = original(**kwargs)
+            if kwargs["archive_index"] == archive_index:
+                raise RuntimeError(f"interrupted after archive {archive_index}")
+            return record
+
+        return mock.patch(
+            "flippars_model_training.pipeline.write_archive_checkpoint",
+            side_effect=wrapped,
+        )
+
+    def test_multiple_resumes_are_byte_identical_to_uninterrupted_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archives = self.build_daily_archives(root / "archives")
+            reference_output = root / "reference" / "prepared.jsonl"
+            reference_manifest = root / "reference" / "manifest.json"
+            reference = self.write_reference(
+                archives, reference_output, reference_manifest
+            )
+
+            resumed_output = root / "resumed" / "prepared.jsonl"
+            resumed_manifest = root / "resumed" / "manifest.json"
+            arguments = self.prepare_arguments(
+                archives, resumed_output, resumed_manifest
+            )
+            with self.interrupt_after_checkpoint(1), self.assertRaisesRegex(
+                RuntimeError, "archive 1"
+            ):
+                prepare_archives(**arguments)
+            checkpoint_root = pipeline_module.archive_checkpoint_root(resumed_output)
+            self.assertEqual(
+                sorted(path.name for path in (checkpoint_root / "archives").iterdir()),
+                ["00000001"],
+            )
+            with self.interrupt_after_checkpoint(2), self.assertRaisesRegex(
+                RuntimeError, "archive 2"
+            ):
+                prepare_archives(**arguments)
+            self.assertEqual(
+                sorted(path.name for path in (checkpoint_root / "archives").iterdir()),
+                ["00000001", "00000002"],
+            )
+
+            resumed = prepare_archives(**arguments)
+            self.assertEqual(resumed_output.read_bytes(), reference_output.read_bytes())
+            self.assertEqual(
+                resumed["datasetContentSha256"], reference["datasetContentSha256"]
+            )
+            reference_value = json.loads(reference_manifest.read_text(encoding="utf-8"))
+            resumed_value = json.loads(resumed_manifest.read_text(encoding="utf-8"))
+            reference_value.pop("createdAt")
+            resumed_value.pop("createdAt")
+            self.assertEqual(resumed_value, reference_value)
+            self.assertTrue(checkpoint_root.is_dir())
+            self.assertEqual(
+                len(list((checkpoint_root / "archives").iterdir())), len(archives)
+            )
+
+    def test_corrupt_chunk_and_checkpoint_schema_fail_closed(self) -> None:
+        for corruption in ("chunk", "schema"):
+            with self.subTest(corruption=corruption), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                archives = self.build_daily_archives(root / "archives", day_count=2)
+                output = root / "run" / "prepared.jsonl"
+                manifest = root / "run" / "manifest.json"
+                arguments = self.prepare_arguments(archives, output, manifest)
+                with self.interrupt_after_checkpoint(1), self.assertRaises(RuntimeError):
+                    prepare_archives(**arguments)
+                checkpoint_directory = (
+                    pipeline_module.archive_checkpoint_root(output)
+                    / "archives"
+                    / "00000001"
+                )
+                if corruption == "chunk":
+                    with (checkpoint_directory / "rows.jsonl").open("ab") as handle:
+                        handle.write(b"{}\n")
+                    expected = "hash or size mismatch"
+                else:
+                    checkpoint_path = checkpoint_directory / "checkpoint.json"
+                    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+                    checkpoint["unexpected"] = True
+                    checkpoint_path.write_text(
+                        json.dumps(checkpoint, indent=2) + "\n", encoding="utf-8"
+                    )
+                    expected = "must contain exactly"
+                with self.assertRaisesRegex(ValueError, expected):
+                    prepare_archives(**arguments)
+                self.assertFalse(output.exists())
+                self.assertFalse(manifest.exists())
+
+    def test_changed_acquisition_input_invalidates_resume_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archives = self.build_daily_archives(root / "archives", day_count=2)
+            acquisition = root / "acquisition.json"
+            acquisition.write_text("{}\n", encoding="utf-8")
+            output = root / "run" / "prepared.jsonl"
+            manifest = root / "run" / "manifest.json"
+            arguments = self.prepare_arguments(
+                archives, output, manifest, acquisition
+            )
+            with self.interrupt_after_checkpoint(1), self.assertRaises(RuntimeError):
+                prepare_archives(**arguments)
+            acquisition.write_text('{"changed":true}\n', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "plan does not match"):
+                prepare_archives(**arguments)
+            self.assertFalse(output.exists())
+            self.assertFalse(manifest.exists())
+
+    def test_published_output_without_manifest_is_verified_and_replayed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archives = self.build_daily_archives(root / "archives", day_count=2)
+            reference_output = root / "reference" / "prepared.jsonl"
+            reference_manifest = root / "reference" / "manifest.json"
+            reference = self.write_reference(
+                archives, reference_output, reference_manifest
+            )
+            output = root / "run" / "prepared.jsonl"
+            manifest = root / "run" / "manifest.json"
+            arguments = self.prepare_arguments(archives, output, manifest)
+            original_sha256_file = pipeline_module.sha256_file
+
+            def fail_after_output_publication(path: Path) -> str:
+                if path == output and output.is_file():
+                    raise RuntimeError("simulated power loss after output publication")
+                return original_sha256_file(path)
+
+            with mock.patch(
+                "flippars_model_training.pipeline.sha256_file",
+                side_effect=fail_after_output_publication,
+            ), self.assertRaisesRegex(RuntimeError, "power loss"):
+                prepare_archives(**arguments)
+            self.assertTrue(output.is_file())
+            self.assertFalse(manifest.exists())
+            published_bytes = output.read_bytes()
+            output.write_bytes(published_bytes + b"tampered")
+            with self.assertRaisesRegex(ValueError, "beyond its checkpoints"):
+                prepare_archives(**arguments)
+            self.assertEqual(output.read_bytes(), published_bytes + b"tampered")
+            output.write_bytes(published_bytes)
+
+            resumed = prepare_archives(**arguments)
+            self.assertEqual(output.read_bytes(), reference_output.read_bytes())
+            self.assertEqual(
+                resumed["datasetContentSha256"], reference["datasetContentSha256"]
+            )
+            self.assertTrue(manifest.is_file())
+            self.assertTrue(
+                pipeline_module.archive_checkpoint_root(output).is_dir()
+            )
+
+    def test_completed_outputs_reconcile_with_persistent_checkpoints(self) -> None:
+        for tamper_manifest in (False, True):
+            with self.subTest(tamper_manifest=tamper_manifest), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                archives = self.build_daily_archives(root / "archives", day_count=2)
+                output = root / "run" / "prepared.jsonl"
+                manifest = root / "run" / "manifest.json"
+                checkpoint_root = pipeline_module.archive_checkpoint_root(output)
+                arguments = self.prepare_arguments(archives, output, manifest)
+                completed = prepare_archives(**arguments)
+                self.assertTrue(output.is_file())
+                self.assertTrue(manifest.is_file())
+                self.assertTrue(checkpoint_root.is_dir())
+                output_bytes = output.read_bytes()
+                manifest_bytes = manifest.read_bytes()
+
+                if tamper_manifest:
+                    manifest_value = json.loads(manifest_bytes.decode("utf-8"))
+                    manifest_value["preparedDatasetSha256"] = "0" * 64
+                    manifest.write_text(
+                        json.dumps(manifest_value, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
+                    tampered_bytes = manifest.read_bytes()
+                    with self.assertRaisesRegex(ValueError, "output binding mismatch"):
+                        prepare_archives(**arguments)
+                    self.assertEqual(output.read_bytes(), output_bytes)
+                    self.assertEqual(manifest.read_bytes(), tampered_bytes)
+                    self.assertTrue(checkpoint_root.is_dir())
+                else:
+                    reconciled = prepare_archives(**arguments)
+                    self.assertEqual(reconciled, completed)
+                    self.assertEqual(output.read_bytes(), output_bytes)
+                    self.assertEqual(manifest.read_bytes(), manifest_bytes)
+                    self.assertTrue(checkpoint_root.is_dir())
+
+    def test_valid_schema_summary_and_report_tampering_fail_closed(self) -> None:
+        for corruption in ("summary", "report"):
+            with self.subTest(corruption=corruption), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                archives = self.build_daily_archives(root / "archives", day_count=2)
+                output = root / "run" / "prepared.jsonl"
+                manifest = root / "run" / "manifest.json"
+                arguments = self.prepare_arguments(archives, output, manifest)
+                with self.interrupt_after_checkpoint(1), self.assertRaises(RuntimeError):
+                    prepare_archives(**arguments)
+                checkpoint_path = (
+                    pipeline_module.archive_checkpoint_root(output)
+                    / "archives"
+                    / "00000001"
+                    / "checkpoint.json"
+                )
+                checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+                if corruption == "summary":
+                    checkpoint["rows"]["windowCount"] += 1
+                    expected = "row summary does not match"
+                else:
+                    checkpoint["report"]["accepted_trade_count"] += 1
+                    expected = "trade-ID range is invalid"
+                identity = dict(checkpoint)
+                identity.pop("checkpointSha256")
+                checkpoint["checkpointSha256"] = (
+                    pipeline_module.checkpoint_identity_sha256(identity)
+                )
+                checkpoint_path.write_text(
+                    json.dumps(checkpoint, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(ValueError, expected):
+                    prepare_archives(**arguments)
+                self.assertFalse(output.exists())
+                self.assertFalse(manifest.exists())
+
+    def test_initial_checkpoint_store_recovers_only_when_provably_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archives = self.build_daily_archives(root / "archives", day_count=2)
+            output = root / "recoverable" / "prepared.jsonl"
+            manifest = root / "recoverable" / "manifest.json"
+            checkpoint_root = pipeline_module.archive_checkpoint_root(output)
+            checkpoint_root.mkdir(parents=True)
+            (checkpoint_root / "archives").mkdir()
+            plan_temporary = checkpoint_root / ".plan.json.abcdefgh.part"
+            plan_temporary.write_text("incomplete", encoding="utf-8")
+            prepare_archives(**self.prepare_arguments(archives, output, manifest))
+            self.assertTrue(output.is_file())
+            self.assertTrue(manifest.is_file())
+            self.assertTrue(checkpoint_root.is_dir())
+
+            ambiguous_output = root / "ambiguous" / "prepared.jsonl"
+            ambiguous_manifest = root / "ambiguous" / "manifest.json"
+            ambiguous_root = pipeline_module.archive_checkpoint_root(ambiguous_output)
+            ambiguous_root.mkdir(parents=True)
+            marker = ambiguous_root / "unowned.txt"
+            marker.write_text("preserve", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "unexpected entries"):
+                prepare_archives(
+                    **self.prepare_arguments(
+                        archives, ambiguous_output, ambiguous_manifest
+                    )
+                )
+            self.assertEqual(marker.read_text(encoding="utf-8"), "preserve")
+            self.assertFalse(ambiguous_output.exists())
+            self.assertFalse(ambiguous_manifest.exists())
+
+    def test_finalization_temporary_cleanup_is_exact_and_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archives = self.build_daily_archives(root / "archives", day_count=2)
+            output = root / "run" / "prepared.jsonl"
+            manifest = root / "run" / "manifest.json"
+            arguments = self.prepare_arguments(archives, output, manifest)
+            with mock.patch(
+                "flippars_model_training.pipeline.write_prepared_dataset",
+                side_effect=RuntimeError("simulated shutdown before finalization"),
+            ), self.assertRaisesRegex(RuntimeError, "before finalization"):
+                prepare_archives(**arguments)
+
+            invalid_name = output.parent / ".prepared.jsonl.invalid!.part"
+            invalid_name.write_text("preserve", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Ambiguous abandoned temporary name"):
+                prepare_archives(**arguments)
+            self.assertEqual(invalid_name.read_text(encoding="utf-8"), "preserve")
+            invalid_name.unlink()
+
+            directory_candidate = output.parent / ".prepared.jsonl.abcdefgh.part"
+            directory_candidate.mkdir()
+            with self.assertRaisesRegex(ValueError, "not a regular file"):
+                prepare_archives(**arguments)
+            self.assertTrue(directory_candidate.is_dir())
+            directory_candidate.rmdir()
+
+            symlink_source = root / "symlink-source.txt"
+            symlink_source.write_text("preserve", encoding="utf-8")
+            symlink_candidate = output.parent / ".prepared.jsonl.ijklmnop.part"
+            try:
+                symlink_candidate.symlink_to(symlink_source)
+            except (NotImplementedError, OSError):
+                pass
+            else:
+                with self.assertRaisesRegex(ValueError, "not a regular file"):
+                    prepare_archives(**arguments)
+                self.assertTrue(symlink_candidate.is_symlink())
+                symlink_candidate.unlink()
+
+            prepared_temporary = output.parent / ".prepared.jsonl.qrstuvwx.part"
+            manifest_temporary = output.parent / ".manifest.json.1234_ab-.part"
+            prepared_temporary.write_text("abandoned", encoding="utf-8")
+            manifest_temporary.write_text("abandoned", encoding="utf-8")
+            prepare_archives(**arguments)
+            self.assertFalse(prepared_temporary.exists())
+            self.assertFalse(manifest_temporary.exists())
+            self.assertTrue(output.is_file())
+            self.assertTrue(manifest.is_file())
+
+    def test_checkpoint_temporary_token_length_mismatch_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archives = self.build_daily_archives(root / "archives", day_count=2)
+            output = root / "run" / "prepared.jsonl"
+            manifest = root / "run" / "manifest.json"
+            arguments = self.prepare_arguments(archives, output, manifest)
+            with self.interrupt_after_checkpoint(1), self.assertRaises(RuntimeError):
+                prepare_archives(**arguments)
+            malformed = (
+                pipeline_module.archive_checkpoint_root(output)
+                / "archives"
+                / ".00000002.short.part"
+            )
+            malformed.mkdir()
+            with self.assertRaisesRegex(ValueError, "unexpected entry"):
+                prepare_archives(**arguments)
+            self.assertTrue(malformed.is_dir())
+            self.assertFalse(output.exists())
+            self.assertFalse(manifest.exists())
+
+    def test_fifteen_minute_reversal_resume_matches_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archives = self.build_daily_archives(root / "archives", day_count=2)
+            signal_type = "FIFTEEN_MINUTE_REVERSAL"
+            reference_output = root / "reference" / "prepared.jsonl"
+            reference_manifest = root / "reference" / "manifest.json"
+            reference = self.write_reference(
+                archives,
+                reference_output,
+                reference_manifest,
+                signal_type,
+            )
+            output = root / "resumed" / "prepared.jsonl"
+            manifest = root / "resumed" / "manifest.json"
+            arguments = self.prepare_arguments(
+                archives,
+                output,
+                manifest,
+                signal_type=signal_type,
+            )
+            with self.interrupt_after_checkpoint(1), self.assertRaises(RuntimeError):
+                prepare_archives(**arguments)
+            resumed = prepare_archives(**arguments)
+            self.assertEqual(output.read_bytes(), reference_output.read_bytes())
+            self.assertEqual(
+                resumed["datasetContentSha256"], reference["datasetContentSha256"]
+            )
 
 
 class AcquisitionEvidenceTests(unittest.TestCase):

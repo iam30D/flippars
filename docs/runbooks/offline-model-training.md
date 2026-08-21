@@ -159,8 +159,8 @@ Set-Location -LiteralPath "C:\Users\HP\Downloads\Flippars"
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 
 $trainingRoot = "C:\Users\HP\Flippars-ml"
-$bootstrapEnvironment = "bootstrap-env-v2"
-$finalEnvironment = "final-env-v2"
+$bootstrapEnvironment = "bootstrap-env-v4"
+$finalEnvironment = "final-env-v4"
 $dependencyProfile = "GovernedBaseline"
 $platformKey = "cp311-win_amd64"
 $lockFile = Join-Path $trainingRoot "locks\governed-baseline\$platformKey\requirements.lock.txt"
@@ -264,7 +264,7 @@ try {
 Set-Location -LiteralPath "C:\Users\HP\Downloads\Flippars"
 
 $trainingRoot = "C:\Users\HP\Flippars-ml"
-$finalEnvironment = "final-env-v2"
+$finalEnvironment = "final-env-v4"
 $start = "2022-01-01"
 $end = "2026-08-02"
 $confidenceThreshold = 0.75
@@ -329,8 +329,12 @@ Preparation verifies each archive SHA-256 before reading it and cross-checks
 archive/checksum bytes, hashes, HTTPS transport URIs, and date coverage against
 the external schema-3 acquisition evidence. Only that complete binding may be
 labeled `PUBLIC_BINANCE_ARCHIVE`; an unattested archive run is explicitly local
-replay. Preparation streams one day at a time and
-writes through a same-volume temporary file. Training validates the entire
+replay. Preparation streams one day at a time and publishes a plan-bound,
+hash-chained checkpoint only after that day's canonical rows and metadata have
+been flushed. A strict same-version resume validates the contiguous checkpoint
+prefix, reconstructs feature history from the last completed day, and continues
+at the first unused archive. Final JSONL publication replays every checkpoint
+through the unchanged dataset writer. Training validates the entire
 canonical JSONL corpus twice, requires byte/count/range-identical pass audits,
 splits unique windows chronologically, and bounds matrix RAM with deterministic
 complete-window samples. Each sampled window must contain
@@ -342,15 +346,28 @@ target, fitted-state, and sampling lineage bindings before writing complete run
 evidence. The verifier output is retained and hashed as
 `cross-runtime-verification.log` in the external run-evidence directory.
 
-If a run fails, do not delete or overwrite its partial evidence automatically.
-Inspect it, fix the cause, and use a new version. `ValidityDays` is an expiry,
-not evidence that calibration will remain stable for that duration.
+Archive checkpoints remain intact throughout fitting, evaluation, and
+cross-runtime verification. Cleanup starts only after the schema-2 `COMPLETE`
+run manifest has been atomically published. Cleanup failure is therefore
+warning-only: the completed run remains auditable, and any exact leftover
+checkpoint directory may be removed by a later reviewed offline cleanup.
+
+If a run stops during archive preparation or after the prepared pair is
+complete but before fitting, rerun the exact same invocation with `-Resume`.
+The runner appends a durable session marker to the existing command log.
+Preparation resumes at the last validated daily archive; fitting restarts from
+epoch zero and reuses the complete prepared pair. `-Resume` rejects partial
+artifacts, completed runs, changed plans, unknown files, links, and malformed
+temporary state. Preserve a rejected state for diagnosis and use a new model
+version without `-Resume`; never rename or copy checkpoints into that version.
+`ValidityDays` is an expiry, not evidence that calibration will remain stable
+for that duration.
 
 ## Optional cleanup after successful replacement
 
 The existing `C:\Users\HP\Flippars-ml\.venv` is an older Python 3.13 exploration
 environment and is not accepted by `FrozenDraft`. After block A succeeds and
-the schema-2 `final-env-v2` evidence has been inspected, it may be removed in a
+the schema-2 `final-env-v4` evidence has been inspected, it may be removed in a
 separate explicit User-run cleanup operation to recover space. Never remove the
 archive cache, isolated dataset, wheelhouse, semantic lock, evidence, or draft
 artifacts as cleanup.
