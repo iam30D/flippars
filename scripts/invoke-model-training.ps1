@@ -16,7 +16,8 @@ param(
   [ValidateRange(90, 365)][int]$ValidityDays = 120,
   [ValidateSet('Exploration', 'FrozenDraft')]
   [string]$Mode = 'FrozenDraft',
-  [switch]$Resume
+  [switch]$Resume,
+  [switch]$ResumePreflightOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -30,6 +31,10 @@ $env:PYTHONUNBUFFERED = '1'
 $env:PYTHONIOENCODING = 'utf-8'
 
 . (Join-Path $PSScriptRoot 'model-training-guardrails.ps1')
+
+if ($ResumePreflightOnly -and -not $Resume) {
+  throw 'ResumePreflightOnly requires -Resume.'
+}
 
 function Get-ModelTrainingRunStartState {
   [CmdletBinding()]
@@ -265,6 +270,332 @@ function Get-ModelTrainingRunStartState {
   }
 }
 
+function Throw-ModelTrainingResumeReplacementRequired {
+  [CmdletBinding()]
+  param([Parameter(Mandatory)][string]$Message)
+
+  $exception = [System.InvalidOperationException]::new($Message)
+  $exception.Data['FlipparsResumeDisposition'] = 'REPLACEMENT_REQUIRED'
+  throw $exception
+}
+
+function Assert-ArchiveResumeSemanticCompatibility {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][string]$CheckpointRoot,
+    [Parameter(Mandatory)][string]$PipelinePath,
+    [Parameter(Mandatory)][string]$AcquisitionManifestPath,
+    [Parameter(Mandatory)][string]$PreparedPath,
+    [Parameter(Mandatory)][string]$DatasetManifestPath,
+    [Parameter(Mandatory)][string]$SignalType,
+    [Parameter(Mandatory)][double]$DeadbandBps,
+    [Parameter(Mandatory)][int]$TimeframeMinutes,
+    [Parameter(Mandatory)][int]$DecisionCadenceSeconds,
+    [Parameter(Mandatory)][int]$MinimumLeadTimeSeconds,
+    [Parameter(Mandatory)][int]$ArchiveCount
+  )
+
+  $planPath = Join-Path $CheckpointRoot 'plan.json'
+  if (-not (Test-Path -LiteralPath $planPath -PathType Leaf)) {
+    Throw-ModelTrainingResumeReplacementRequired -Message (
+      'Resume requires a durable archive-preparation plan before semantic ' +
+      'compatibility can be established. Preserve this run and use a new model version.'
+    )
+  }
+  $planItem = Get-Item -LiteralPath $planPath -Force
+  if (($planItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw 'Resume rejects a reparse-point archive-preparation plan.'
+  }
+  try {
+    $plan = Get-Content -LiteralPath $planPath -Raw | ConvertFrom-Json
+  } catch {
+    throw 'Resume archive-preparation plan is not valid JSON.'
+  }
+  if ([string]::IsNullOrWhiteSpace([string]$plan.schemaVersion)) {
+    throw 'Resume archive-preparation plan has an unsupported identity.'
+  }
+  if ($plan.schemaVersion -ne 'flippars.archive-preparation-plan/1') {
+    Throw-ModelTrainingResumeReplacementRequired -Message (
+      'Resume archive-preparation plan uses a different schema. ' +
+      'Preserve this run and use a new model version.'
+    )
+  }
+  if ([string]$plan.fingerprintSha256 -cnotmatch '^[a-f0-9]{64}$') {
+    throw 'Resume archive-preparation plan has an invalid fingerprint.'
+  }
+  $inputs = $plan.inputs
+  if ($null -eq $inputs) {
+    throw 'Resume archive-preparation plan is missing its immutable inputs.'
+  }
+  if (($inputs.schemas.dataset -ne 'flippars.training-dataset/3') -or
+      ($inputs.schemas.datasetManifest -ne 'flippars.dataset-manifest/3') -or
+      ($inputs.schemas.feature -ne 'binance-spot-signal-features/1') -or
+      ($inputs.schemas.labelPolicy -ne 'binance-spot-trade-close-relation/1') -or
+      ($inputs.schemas.decisionPolicy -ne 'flippars-signal-candidate-sampling/1')) {
+    Throw-ModelTrainingResumeReplacementRequired -Message (
+      'Resume archive-preparation schemas differ from the current gap-aware policy. ' +
+      'Preserve this run and use a new model version.'
+    )
+  }
+  if ([string]$inputs.generator.pipelineSha256 -cnotmatch '^[a-f0-9]{64}$') {
+    throw 'Resume archive-preparation generator has an invalid pipeline digest.'
+  }
+  if ($inputs.generator.packageVersion -ne '0.3.0') {
+    Throw-ModelTrainingResumeReplacementRequired -Message (
+      'Resume archive-preparation generator is incompatible with the current runner. ' +
+      'Preserve this run and use a new model version.'
+    )
+  }
+  $currentPipelineSha256 = (
+    Get-FileHash -LiteralPath $PipelinePath -Algorithm SHA256
+  ).Hash.ToLowerInvariant()
+  if (([string]$inputs.generator.pipelineSha256).ToLowerInvariant() -ne
+      $currentPipelineSha256) {
+    Throw-ModelTrainingResumeReplacementRequired -Message (
+      'Resume archive-preparation code digest differs from the current pipeline. ' +
+      'Preserve this run and use a new model version.'
+    )
+  }
+  $options = $inputs.options
+  if (($options.signal_type -ne $SignalType) -or
+      ([double]$options.deadband_bps -ne $DeadbandBps) -or
+      ([int]$options.timeframe_minutes -ne $TimeframeMinutes) -or
+      ([int]$options.decision_cadence_seconds -ne $DecisionCadenceSeconds) -or
+      ([int]$options.minimum_lead_time_seconds -ne $MinimumLeadTimeSeconds)) {
+    Throw-ModelTrainingResumeReplacementRequired -Message (
+      'Resume archive-preparation options differ from the requested signal policy. ' +
+      'Preserve this run and use a new model version.'
+    )
+  }
+  if ((ConvertTo-NormalizedFullPath ([string]$inputs.output)) -cne
+      (ConvertTo-NormalizedFullPath $PreparedPath) -or
+      (ConvertTo-NormalizedFullPath ([string]$inputs.manifestOutput)) -cne
+      (ConvertTo-NormalizedFullPath $DatasetManifestPath)) {
+    Throw-ModelTrainingResumeReplacementRequired -Message (
+      'Resume archive-preparation outputs differ from the immutable plan. ' +
+      'Preserve this run and use a new model version.'
+    )
+  }
+  if (-not (Test-Path -LiteralPath $AcquisitionManifestPath -PathType Leaf)) {
+    throw 'Resume acquisition evidence is missing.'
+  }
+  $acquisitionInput = $inputs.acquisitionManifest
+  if (($null -eq $acquisitionInput) -or
+      ((ConvertTo-NormalizedFullPath ([string]$acquisitionInput.path)) -cne
+       (ConvertTo-NormalizedFullPath $AcquisitionManifestPath))) {
+    Throw-ModelTrainingResumeReplacementRequired -Message (
+      'Resume acquisition evidence path differs from the immutable plan. ' +
+      'Preserve this run and use a new model version.'
+    )
+  }
+  $currentAcquisitionSha256 = (
+    Get-FileHash -LiteralPath $AcquisitionManifestPath -Algorithm SHA256
+  ).Hash.ToLowerInvariant()
+  if (([string]$acquisitionInput.sha256).ToLowerInvariant() -ne
+      $currentAcquisitionSha256) {
+    Throw-ModelTrainingResumeReplacementRequired -Message (
+      'Resume acquisition evidence digest differs from the immutable plan. ' +
+      'Preserve this run and use a new model version.'
+    )
+  }
+  if (@($inputs.archives).Count -ne $ArchiveCount) {
+    Throw-ModelTrainingResumeReplacementRequired -Message (
+      'Resume archive count differs from the requested immutable date range. ' +
+      'Preserve this run and use a new model version.'
+    )
+  }
+
+  $archivesRoot = Join-Path $CheckpointRoot 'archives'
+  $archiveCheckpointEntries = @(
+    Get-ChildItem -LiteralPath $archivesRoot -Force
+  )
+  $durableArchiveCheckpointEntries = @()
+  foreach ($entry in $archiveCheckpointEntries) {
+    if ([string]$entry.Name -cmatch
+        '^\.[0-9]{8}\.[A-Za-z0-9_-]{8}\.part$') {
+      if (-not $entry.PSIsContainer -or
+          (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw 'Resume archive checkpoint temporary entry is invalid.'
+      }
+      $temporaryDirectories = [System.Collections.Generic.Stack[string]]::new()
+      $temporaryDirectories.Push($entry.FullName)
+      while ($temporaryDirectories.Count -gt 0) {
+        $temporaryDirectory = $temporaryDirectories.Pop()
+        foreach ($temporaryChild in @(
+          Get-ChildItem -LiteralPath $temporaryDirectory -Force
+        )) {
+          if (($temporaryChild.Attributes -band
+              [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Resume archive checkpoint temporary contains a reparse point.'
+          }
+          if ($temporaryChild.PSIsContainer) {
+            $temporaryDirectories.Push($temporaryChild.FullName)
+          }
+        }
+      }
+      continue
+    }
+    if (-not $entry.PSIsContainer -or
+        (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) -or
+        ([string]$entry.Name -cnotmatch '^[0-9]{8}$')) {
+      throw 'Resume archive checkpoints contain an invalid entry.'
+    }
+    $durableArchiveCheckpointEntries += $entry
+    $checkpointPath = Join-Path $entry.FullName 'checkpoint.json'
+    if (-not (Test-Path -LiteralPath $checkpointPath -PathType Leaf)) {
+      throw 'Resume archive checkpoint is missing checkpoint.json.'
+    }
+    try {
+      $checkpoint = Get-Content -LiteralPath $checkpointPath -Raw | ConvertFrom-Json
+    } catch {
+      throw 'Resume archive checkpoint is not valid JSON.'
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$checkpoint.schemaVersion)) {
+      throw 'Resume archive checkpoint is missing its schema identity.'
+    }
+    if ($checkpoint.schemaVersion -ne 'flippars.archive-preparation-checkpoint/2') {
+      Throw-ModelTrainingResumeReplacementRequired -Message (
+        'Resume archive checkpoint uses a different schema. ' +
+        'Preserve this run and use a new model version.'
+      )
+    }
+    if ([string]$checkpoint.planFingerprintSha256 -cnotmatch '^[a-f0-9]{64}$') {
+      throw 'Resume archive checkpoint has an invalid plan fingerprint.'
+    }
+    if ($checkpoint.planFingerprintSha256 -cne $plan.fingerprintSha256) {
+      throw 'Resume archive checkpoint fingerprint contradicts the durable plan.'
+    }
+  }
+  if ($durableArchiveCheckpointEntries.Count -eq 0) {
+    Throw-ModelTrainingResumeReplacementRequired -Message (
+      'Resume has no durable daily checkpoint to preserve. ' +
+      'Preserve this run and use a new model version.'
+    )
+  }
+}
+
+function Get-ArchiveResumeSemanticDisposition {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][string]$CheckpointRoot,
+    [Parameter(Mandatory)][string]$PipelinePath,
+    [Parameter(Mandatory)][string]$AcquisitionManifestPath,
+    [Parameter(Mandatory)][string]$PreparedPath,
+    [Parameter(Mandatory)][string]$DatasetManifestPath,
+    [Parameter(Mandatory)][string]$SignalType,
+    [Parameter(Mandatory)][double]$DeadbandBps,
+    [Parameter(Mandatory)][int]$TimeframeMinutes,
+    [Parameter(Mandatory)][int]$DecisionCadenceSeconds,
+    [Parameter(Mandatory)][int]$MinimumLeadTimeSeconds,
+    [Parameter(Mandatory)][int]$ArchiveCount
+  )
+
+  try {
+    Assert-ArchiveResumeSemanticCompatibility @PSBoundParameters
+    return [pscustomobject][ordered]@{
+      Disposition = 'PYTHON_VALIDATION_REQUIRED'
+      Reason = $null
+    }
+  } catch {
+    if ([string]$_.Exception.Data['FlipparsResumeDisposition'] -ceq
+        'REPLACEMENT_REQUIRED') {
+      return [pscustomobject][ordered]@{
+        Disposition = 'REPLACEMENT_REQUIRED'
+        Reason = $_.Exception.Message
+      }
+    }
+    throw
+  }
+}
+
+function Assert-PythonArchiveResumeAdmission {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][string]$PythonPath,
+    [Parameter(Mandatory)][string]$SourceRoot,
+    [Parameter(Mandatory)][string]$RepositoryRoot,
+    [Parameter(Mandatory)][string]$ArchiveRoot,
+    [Parameter(Mandatory)][string]$Start,
+    [Parameter(Mandatory)][string]$End,
+    [Parameter(Mandatory)][string]$PreparedPath,
+    [Parameter(Mandatory)][string]$DatasetManifestPath,
+    [Parameter(Mandatory)][string]$AcquisitionManifestPath,
+    [Parameter(Mandatory)][string]$SignalType,
+    [Parameter(Mandatory)][double]$DeadbandBps,
+    [Parameter(Mandatory)][int]$TimeframeMinutes,
+    [Parameter(Mandatory)][int]$DecisionCadenceSeconds,
+    [Parameter(Mandatory)][int]$MinimumLeadTimeSeconds,
+    [Parameter(Mandatory)][int]$ArchiveCount
+  )
+
+  $previousPythonPath = $env:PYTHONPATH
+  $env:PYTHONPATH = $SourceRoot
+  try {
+    Write-Host (
+      'Running read-only Python checkpoint admission; validating the latest and ' +
+      'next source archives can be quiet for several minutes...'
+    ) -ForegroundColor DarkCyan
+    $result = Invoke-CapturedNativeProcess `
+      -FilePath $PythonPath `
+      -ArgumentList @(
+        '-m', 'flippars_model_training', 'preflight-archive-resume',
+        '--archive-root', $ArchiveRoot,
+        '--start', $Start,
+        '--end', $End,
+        '--output', $PreparedPath,
+        '--manifest-output', $DatasetManifestPath,
+        '--acquisition-manifest', $AcquisitionManifestPath,
+        '--signal-type', $SignalType,
+        '--deadband-bps', [string]$DeadbandBps,
+        '--timeframe-minutes', [string]$TimeframeMinutes,
+        '--decision-cadence-seconds', [string]$DecisionCadenceSeconds,
+        '--minimum-lead-time-seconds', [string]$MinimumLeadTimeSeconds
+      ) `
+      -WorkingDirectory $RepositoryRoot
+  } finally {
+    $env:PYTHONPATH = $previousPythonPath
+  }
+  if ([int]$result.ExitCode -ne 0) {
+    $failure = ([string]$result.Stderr).Trim()
+    if ([string]::IsNullOrWhiteSpace($failure)) {
+      $failure = 'Python returned no diagnostic output.'
+    }
+    throw "Python archive-resume admission failed: $failure"
+  }
+  if (-not [string]::IsNullOrWhiteSpace([string]$result.Stderr)) {
+    throw 'Python archive-resume admission emitted unexpected diagnostic output.'
+  }
+  $responseText = ([string]$result.Stdout).Trim()
+  if ([string]::IsNullOrWhiteSpace($responseText) -or
+      $responseText -match '[\r\n]') {
+    throw 'Python archive-resume admission did not return exactly one JSON record.'
+  }
+  try {
+    $response = $responseText | ConvertFrom-Json -ErrorAction Stop
+  } catch {
+    throw 'Python archive-resume admission returned invalid JSON.'
+  }
+  $archiveCountIsInteger = (
+    ($response.archiveCount -is [int]) -or
+    ($response.archiveCount -is [long])
+  )
+  $checkpointCountIsInteger = (
+    ($response.checkpointCount -is [int]) -or
+    ($response.checkpointCount -is [long])
+  )
+  if (($response.schemaVersion -cne 'flippars.archive-resume-admission/1') -or
+      ($response.state -cne 'ArchivePreparation') -or
+      (-not ($response.readOnly -is [bool])) -or
+      ($response.readOnly -ne $true) -or
+      (-not $archiveCountIsInteger) -or
+      (-not $checkpointCountIsInteger) -or
+      ([int]$response.archiveCount -ne $ArchiveCount) -or
+      ([int]$response.checkpointCount -lt 1) -or
+      ([int]$response.checkpointCount -gt $ArchiveCount)) {
+    throw 'Python archive-resume admission returned an invalid contract.'
+  }
+}
+
 function Write-ModelTrainingResumeSessionMarker {
   [CmdletBinding()]
   param(
@@ -362,6 +693,8 @@ function Remove-CompletedArchiveCheckpointStore {
 }
 
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$sourceRoot = Join-Path $repositoryRoot 'apps\model-training\src'
+$pipelinePath = Join-Path $sourceRoot 'flippars_model_training\pipeline.py'
 $trainingPath = Assert-ExternalTrainingRoot $TrainingRoot $repositoryRoot
 $safeEnvironmentName = Assert-SafeEnvironmentName $EnvironmentName
 $safeVersion = Assert-SafeModelVersion $Version
@@ -422,6 +755,77 @@ $runStartState = Get-ModelTrainingRunStartState `
   -CheckpointRoot $archiveCheckpointRoot `
   -CommandLogPath $cliOutputPath `
   -Resume:$Resume
+$resumeSemanticDisposition = [pscustomobject][ordered]@{
+  Disposition = 'NOT_APPLICABLE'
+  Reason = $null
+}
+if ($Resume) {
+  if ($runStartState.Kind -eq 'PreparedDataset') {
+    $resumeSemanticDisposition = [pscustomobject][ordered]@{
+      Disposition = 'REPLACEMENT_REQUIRED'
+      Reason = (
+        'The prepared pair has no durable archive checkpoint plan. ' +
+        'Preserve this run and use a new model version.'
+      )
+    }
+  } elseif ($runStartState.Kind -eq 'ArchivePreparation') {
+    $resumeCompatibilityParameters = @{
+      CheckpointRoot = $archiveCheckpointRoot
+      PipelinePath = $pipelinePath
+      AcquisitionManifestPath = $acquisitionManifestPath
+      PreparedPath = $preparedPath
+      DatasetManifestPath = $datasetManifestPath
+      SignalType = $SignalType
+      DeadbandBps = $deadbandBps
+      TimeframeMinutes = $timeframeMinutes
+      DecisionCadenceSeconds = $decisionCadenceSeconds
+      MinimumLeadTimeSeconds = $minimumLeadTimeSeconds
+      ArchiveCount = $requestedFiles
+    }
+    $resumeSemanticDisposition = Get-ArchiveResumeSemanticDisposition `
+      @resumeCompatibilityParameters
+    if ($resumeSemanticDisposition.Disposition -ceq
+        'PYTHON_VALIDATION_REQUIRED') {
+      Assert-PythonArchiveResumeAdmission `
+        -PythonPath $pythonPath `
+        -SourceRoot $sourceRoot `
+        -RepositoryRoot $repositoryRoot `
+        -ArchiveRoot $archiveRoot `
+        -Start $Start `
+        -End $End `
+        -PreparedPath $preparedPath `
+        -DatasetManifestPath $datasetManifestPath `
+        -AcquisitionManifestPath $acquisitionManifestPath `
+        -SignalType $SignalType `
+        -DeadbandBps $deadbandBps `
+        -TimeframeMinutes $timeframeMinutes `
+        -DecisionCadenceSeconds $decisionCadenceSeconds `
+        -MinimumLeadTimeSeconds $minimumLeadTimeSeconds `
+        -ArchiveCount $requestedFiles
+      $resumeSemanticDisposition = [pscustomobject][ordered]@{
+        Disposition = 'RESUMABLE'
+        Reason = $null
+      }
+    }
+  }
+}
+if ($ResumePreflightOnly) {
+  [ordered]@{
+    schemaVersion = 'flippars.model-training-resume-preflight/1'
+    disposition = [string]$resumeSemanticDisposition.Disposition
+    state = [string]$runStartState.Kind
+    version = $safeVersion
+    reason = $resumeSemanticDisposition.Reason
+  } | ConvertTo-Json -Compress
+  return
+}
+if ($Resume -and
+    $resumeSemanticDisposition.Disposition -ceq 'REPLACEMENT_REQUIRED') {
+  throw (
+    'Same-version resume is incompatible: {0}' -f `
+      [string]$resumeSemanticDisposition.Reason
+  )
+}
 
 Assert-NoTrackedTrainingMaterial $repositoryRoot
 & node (Join-Path $repositoryRoot 'scripts\check-repository.mjs')
@@ -571,7 +975,6 @@ if ($runStartState.Kind -eq 'Fresh') {
   New-Item -ItemType Directory -Path $runEvidenceRoot | Out-Null
 }
 
-$sourceRoot = Join-Path $repositoryRoot 'apps\model-training\src'
 $previousPythonPath = $env:PYTHONPATH
 $env:PYTHONPATH = $sourceRoot
 try {
@@ -603,13 +1006,18 @@ try {
       -WorkingDirectory $repositoryRoot `
       -Append:$runStartState.AppendFirstChild
     if ($prepareExitCode -ne 0) {
-      throw "Offline dataset preparation failed with exit code $prepareExitCode."
+      throw (
+        "Offline dataset preparation failed with exit code $prepareExitCode. " +
+        'For an interruption or transient failure with unchanged source, code, and policy, ' +
+        'rerun the exact same invocation with -Resume. If source, code, or policy was ' +
+        'corrected or changed, preserve this run and use a new model version without -Resume.'
+      )
     }
   } else {
     Write-Host 'Reusing the complete prepared dataset pair after strict resume admission.'
   }
   $preparedManifest = Get-Content -LiteralPath $datasetManifestPath -Raw | ConvertFrom-Json
-  if (($preparedManifest.schemaVersion -ne 'flippars.dataset-manifest/2') -or
+  if (($preparedManifest.schemaVersion -ne 'flippars.dataset-manifest/3') -or
       ($preparedManifest.symbol -ne 'BTCUSDT') -or
       ($preparedManifest.source.lineageKind -ne 'PUBLIC_BINANCE_ARCHIVE') -or
       ($preparedManifest.source.startDateInclusive -ne $Start) -or
@@ -695,7 +1103,7 @@ foreach ($requiredOutput in @(
 
 $artifact = Get-Content -LiteralPath $artifactPath -Raw | ConvertFrom-Json
 $evaluation = Get-Content -LiteralPath $evaluationPath -Raw | ConvertFrom-Json
-if (($artifact.schemaVersion -ne 'flippars.multinomial-candidate/3') -or
+if (($artifact.schemaVersion -ne 'flippars.multinomial-candidate/4') -or
     ($artifact.status -ne 'DRAFT') -or
     ($artifact.signalType -ne $SignalType) -or
     ($artifact.version -ne $safeVersion)) {
@@ -713,8 +1121,8 @@ if (($artifact.target.venue -ne 'BINANCE') -or
   throw 'Draft target contract does not match the governed training invocation.'
 }
 if (($evaluation.status -ne 'DRAFT') -or
-    ($evaluation.schemaVersion -ne 'flippars.model-evaluation/3') -or
-    ($evaluation.artifactSchemaVersion -ne 'flippars.multinomial-candidate/3') -or
+    ($evaluation.schemaVersion -ne 'flippars.model-evaluation/4') -or
+    ($evaluation.artifactSchemaVersion -ne 'flippars.multinomial-candidate/4') -or
     ([bool]$evaluation.productionEligible) -or
     ($evaluation.evaluationScope -ne 'BINANCE_CONDITIONAL_DETERMINISTIC_WINDOW_SAMPLE_DIAGNOSTIC_ONLY') -or
     ($evaluation.signalType -ne $SignalType) -or
@@ -740,13 +1148,12 @@ if (($evaluation.productionGuardedPolicyReplay.scope -ne 'PRODUCTION_GUARDED_REP
 if ($evaluation.calibrationByDecisionPopulation.userFacingConfidenceCalibrationClaimSupported -ne $false) {
   throw 'Draft evaluation must not claim user-facing confidence calibration support.'
 }
-$pipelinePath = Join-Path $sourceRoot 'flippars_model_training\pipeline.py'
 $pipelineHash = (Get-FileHash -LiteralPath $pipelinePath -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($pipelineHash -ne ([string]$artifact.trainingCodeSha256).ToLowerInvariant()) {
   throw 'Artifact training-code digest does not match the executed pipeline.'
 }
 
-$crossRuntimeVerifier = Join-Path $repositoryRoot 'scripts\verify-python-v3-artifact.mjs'
+$crossRuntimeVerifier = Join-Path $repositoryRoot 'scripts\verify-python-artifact.mjs'
 $compiledContract = Join-Path $repositoryRoot 'packages\contracts\dist\index.js'
 $compiledArtifactSchema = Join-Path $repositoryRoot 'packages\model-artifact\dist\schema.js'
 foreach ($verifierInput in @(

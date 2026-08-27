@@ -10,6 +10,8 @@ import {
   ApprovalStatementSchema,
   BinanceModelBundleManifestSchema,
   DraftBinanceMultinomialArtifactSchema,
+  DraftBinanceMultinomialArtifactV3Schema,
+  DraftBinanceMultinomialArtifactV4Schema,
   DraftMultinomialArtifactSchema,
   ModelBundleManifestSchema,
   SignedApprovalSetSchema,
@@ -333,6 +335,41 @@ describe("governed model artifact contracts", () => {
       }).success,
       false,
     );
+  });
+
+  it("keeps gap-free V3 and gap-aware V4 artifact contracts distinct", () => {
+    const v3 = buildBinanceCandidate();
+    const gappedV3 = {
+      ...v3,
+      datasetManifest: {
+        ...v3.datasetManifest,
+        gapCount: 30,
+      },
+    };
+    const v4 = {
+      ...v3,
+      schemaVersion: "flippars.multinomial-candidate/4",
+      datasetManifest: {
+        ...v3.datasetManifest,
+        schemaVersion: "flippars.dataset-manifest-summary/4",
+        gapCount: 30,
+        preparedWindowCount: 370,
+        preparedDecisionRowCount: 3_700,
+        partitionWindowCounts: {
+          modelFit: 222,
+          calibration: 74,
+          evaluation: 74,
+        },
+      },
+    };
+
+    assert.equal(
+      DraftBinanceMultinomialArtifactV3Schema.safeParse(gappedV3).success,
+      false,
+    );
+    assert.equal(DraftBinanceMultinomialArtifactV3Schema.safeParse(v4).success, false);
+    assert.equal(DraftBinanceMultinomialArtifactV4Schema.safeParse(v4).success, true);
+    assert.equal(DraftBinanceMultinomialArtifactSchema.safeParse(v4).success, true);
   });
 
   it("rejects a fully valid and signed v3 bundle only at the offline-only boundary", () => {

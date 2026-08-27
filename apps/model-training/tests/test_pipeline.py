@@ -49,6 +49,7 @@ from flippars_model_training.pipeline import (
     parse_trade_row,
     policy_digest,
     prepare_archives,
+    preflight_archive_resume,
     pre_evaluation_sampling_contract,
     replay_policy,
     select_offline_archives,
@@ -410,11 +411,19 @@ class ArchiveTests(unittest.TestCase):
 
 
 class ResumableArchivePreparationTests(unittest.TestCase):
-    def build_daily_archives(self, root: Path, day_count: int = 3) -> list[Path]:
+    def build_daily_archives(
+        self,
+        root: Path,
+        day_count: int = 3,
+        *,
+        gap_windows: dict[int, set[int]] | None = None,
+        trade_id_jump_at: tuple[int, int] | None = None,
+    ) -> list[Path]:
         root.mkdir(parents=True, exist_ok=True)
         start = datetime(2025, 1, 1, tzinfo=UTC)
         trade_id = 1
         paths: list[Path] = []
+        excluded = gap_windows or {}
         for day_index in range(day_count):
             day_start = start + timedelta(days=day_index)
             day_text = day_start.date().isoformat()
@@ -422,6 +431,10 @@ class ResumableArchivePreparationTests(unittest.TestCase):
             member_name = f"BTCUSDT-trades-{day_text}.csv"
             lines = ["id,price,qty,quoteQty,time,isBuyerMaker,isBestMatch\n"]
             for candle_index in range(288):
+                if candle_index in excluded.get(day_index, set()):
+                    continue
+                if trade_id_jump_at == (day_index, candle_index):
+                    trade_id += 1
                 event_time = day_start + timedelta(minutes=5 * candle_index)
                 price = 50_000 + day_index * 100 + (candle_index % 17) - 8
                 quantity = 0.1 + (candle_index % 3) * 0.01
@@ -443,6 +456,39 @@ class ResumableArchivePreparationTests(unittest.TestCase):
             )
             paths.append(archive_path)
         return paths
+
+    def test_missing_trade_id_and_incomplete_day_edges_fail_preparation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            missing_id_archives = self.build_daily_archives(
+                root / "missing-id",
+                trade_id_jump_at=(1, 138),
+            )
+            with self.assertRaisesRegex(ValueError, "missing Binance trade IDs"):
+                prepare_archives(
+                    **self.prepare_arguments(
+                        missing_id_archives,
+                        root / "missing-id-output" / "prepared.jsonl",
+                        root / "missing-id-output" / "manifest.json",
+                    )
+                )
+
+            for edge_name, gap_index in (("first", 0), ("last", 287)):
+                with self.subTest(edge=edge_name):
+                    edge_archives = self.build_daily_archives(
+                        root / f"missing-{edge_name}-edge",
+                        gap_windows={1: {gap_index}},
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError, "does not cover its complete aligned UTC day"
+                    ):
+                        prepare_archives(
+                            **self.prepare_arguments(
+                                edge_archives,
+                                root / f"missing-{edge_name}-edge-output" / "prepared.jsonl",
+                                root / f"missing-{edge_name}-edge-output" / "manifest.json",
+                            )
+                        )
 
     def prepare_arguments(
         self,
@@ -525,6 +571,7 @@ class ResumableArchivePreparationTests(unittest.TestCase):
                 RuntimeError, "archive 1"
             ):
                 prepare_archives(**arguments)
+
             checkpoint_root = pipeline_module.archive_checkpoint_root(resumed_output)
             self.assertEqual(
                 sorted(path.name for path in (checkpoint_root / "archives").iterdir()),
@@ -553,6 +600,378 @@ class ResumableArchivePreparationTests(unittest.TestCase):
             self.assertEqual(
                 len(list((checkpoint_root / "archives").iterdir())), len(archives)
             )
+
+    def test_archive_resume_preflight_is_read_only_and_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archives = self.build_daily_archives(root / "archives")
+            output = root / "resumed" / "prepared.jsonl"
+            manifest = root / "resumed" / "manifest.json"
+            arguments = self.prepare_arguments(archives, output, manifest)
+            with self.interrupt_after_checkpoint(1), self.assertRaisesRegex(
+                RuntimeError, "archive 1"
+            ):
+                prepare_archives(**arguments)
+
+            checkpoint_root = pipeline_module.archive_checkpoint_root(output)
+            abandoned_temporary = (
+                checkpoint_root / "archives" / ".00000002.abcdefgh.part"
+            )
+            abandoned_temporary.mkdir()
+            (abandoned_temporary / "partial.jsonl").write_text(
+                '{"partial":true}\n', encoding="utf-8"
+            )
+
+            def snapshot() -> dict[str, tuple[str, str | None]]:
+                result: dict[str, tuple[str, str | None]] = {}
+                for path in sorted(root.rglob("*")):
+                    relative = path.relative_to(root).as_posix()
+                    if path.is_file():
+                        result[relative] = (
+                            "file",
+                            hashlib.sha256(path.read_bytes()).hexdigest(),
+                        )
+                    else:
+                        result[relative] = ("directory", None)
+                return result
+
+            before = snapshot()
+            admitted = preflight_archive_resume(**arguments)
+            self.assertEqual(
+                admitted,
+                {
+                    "schemaVersion": "flippars.archive-resume-admission/1",
+                    "state": "ArchivePreparation",
+                    "archiveCount": 3,
+                    "checkpointCount": 1,
+                    "preparedOutputPresent": False,
+                    "datasetManifestPresent": False,
+                    "readOnly": True,
+                },
+            )
+            self.assertEqual(snapshot(), before)
+
+            checkpoint_directory = (
+                pipeline_module.archive_checkpoint_root(output)
+                / "archives"
+                / "00000001"
+            )
+            chunk_path = checkpoint_directory / "rows.jsonl"
+            original_chunk = chunk_path.read_bytes()
+            chunk_path.write_bytes(original_chunk + b"{}\n")
+            with self.assertRaisesRegex(ValueError, "row summary|chunk"):
+                preflight_archive_resume(**arguments)
+            chunk_path.write_bytes(original_chunk)
+
+            checkpoint_path = checkpoint_directory / "checkpoint.json"
+            original_checkpoint = checkpoint_path.read_bytes()
+            checkpoint_value = json.loads(original_checkpoint)
+            checkpoint_path.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": checkpoint_value["schemaVersion"],
+                        "planFingerprintSha256": checkpoint_value[
+                            "planFingerprintSha256"
+                        ],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "exactly"):
+                preflight_archive_resume(**arguments)
+            checkpoint_path.write_bytes(original_checkpoint)
+
+            original_archive = archives[0].read_bytes()
+            changed_archive = bytearray(original_archive)
+            changed_archive[-1] ^= 1
+            archives[0].write_bytes(changed_archive)
+            with self.assertRaises(ValueError):
+                preflight_archive_resume(**arguments)
+            archives[0].write_bytes(original_archive)
+
+            prepare_archives(**arguments)
+            self.assertFalse(abandoned_temporary.exists())
+            completed_before = snapshot()
+            completed = preflight_archive_resume(**arguments)
+            self.assertTrue(completed["preparedOutputPresent"])
+            self.assertTrue(completed["datasetManifestPresent"])
+            self.assertEqual(completed["checkpointCount"], len(archives))
+            self.assertEqual(snapshot(), completed_before)
+
+    def test_gap_lineage_poisoning_and_resume_are_byte_identical(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            gap_indices = {1: set(range(138, 168))}
+            archives = self.build_daily_archives(
+                root / "archives", gap_windows=gap_indices
+            )
+            reference_output = root / "reference" / "prepared.jsonl"
+            reference_manifest = root / "reference" / "manifest.json"
+            reference = self.write_reference(
+                archives, reference_output, reference_manifest
+            )
+            gap_start = datetime(2025, 1, 2, 11, 30, tzinfo=UTC)
+            expected_gaps = [
+                format_timestamp(gap_start + timedelta(minutes=5 * offset))
+                for offset in range(30)
+            ]
+            manifest_value = json.loads(
+                reference_manifest.read_text(encoding="utf-8")
+            )
+            self.assertEqual(reference["gapCount"], 30)
+            self.assertEqual(manifest_value["gapCount"], 30)
+            self.assertEqual(manifest_value["gapWindowStarts"], expected_gaps)
+
+            rows = [
+                json.loads(line)
+                for line in reference_output.read_text(encoding="utf-8").splitlines()
+            ]
+            row_windows = {str(row["windowStart"]) for row in rows}
+            poisoned_windows = {
+                format_timestamp(
+                    parse_timestamp(gap) + timedelta(minutes=5 * lookahead)
+                )
+                for gap in expected_gaps
+                for lookahead in range(14)
+            }
+            self.assertTrue(row_windows.isdisjoint(poisoned_windows))
+            self.assertNotIn("2025-01-02T15:00:00.000Z", row_windows)
+            self.assertIn("2025-01-02T15:05:00.000Z", row_windows)
+
+            resumed_output = root / "resumed" / "prepared.jsonl"
+            resumed_manifest = root / "resumed" / "manifest.json"
+            arguments = self.prepare_arguments(
+                archives, resumed_output, resumed_manifest
+            )
+            with self.interrupt_after_checkpoint(2), self.assertRaisesRegex(
+                RuntimeError, "archive 2"
+            ):
+                prepare_archives(**arguments)
+            checkpoint_path = (
+                pipeline_module.archive_checkpoint_root(resumed_output)
+                / "archives"
+                / "00000002"
+                / "checkpoint.json"
+            )
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                checkpoint["schemaVersion"],
+                "flippars.archive-preparation-checkpoint/2",
+            )
+            self.assertEqual(checkpoint["gapWindowStarts"], expected_gaps)
+
+            resumed = prepare_archives(**arguments)
+            self.assertEqual(resumed_output.read_bytes(), reference_output.read_bytes())
+            self.assertEqual(
+                resumed["datasetContentSha256"], reference["datasetContentSha256"]
+            )
+            resumed_value = json.loads(resumed_manifest.read_text(encoding="utf-8"))
+            manifest_value.pop("createdAt")
+            resumed_value.pop("createdAt")
+            self.assertEqual(resumed_value, manifest_value)
+            reconciled = prepare_archives(**arguments)
+            self.assertEqual(reconciled, resumed)
+
+    def test_fifteen_minute_gap_lineage_uses_signal_aligned_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archives = self.build_daily_archives(
+                root / "archives", gap_windows={1: set(range(138, 168))}
+            )
+            output = root / "reference" / "prepared.jsonl"
+            manifest = root / "reference" / "manifest.json"
+            result = self.write_reference(
+                archives,
+                output,
+                manifest,
+                signal_type="FIFTEEN_MINUTE_REVERSAL",
+            )
+            manifest_value = json.loads(manifest.read_text(encoding="utf-8"))
+            self.assertEqual(result["gapCount"], 10)
+            self.assertEqual(
+                manifest_value["gapWindowStarts"],
+                [
+                    format_timestamp(
+                        datetime(2025, 1, 2, 11, 30, tzinfo=UTC)
+                        + timedelta(minutes=15 * offset)
+                    )
+                    for offset in range(10)
+                ],
+            )
+            row_windows = {
+                str(json.loads(line)["windowStart"])
+                for line in output.read_text(encoding="utf-8").splitlines()
+            }
+            poisoned_windows = {
+                format_timestamp(
+                    datetime(2025, 1, 2, 11, 30, tzinfo=UTC)
+                    + timedelta(minutes=15 * lookahead)
+                )
+                for lookahead in range(14)
+            }
+            self.assertTrue(row_windows.isdisjoint(poisoned_windows))
+            self.assertNotIn("2025-01-02T17:00:00.000Z", row_windows)
+            self.assertIn("2025-01-02T17:15:00.000Z", row_windows)
+
+    def test_resume_preserves_an_earlier_cross_day_gap_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archives = self.build_daily_archives(
+                root / "archives",
+                day_count=4,
+                gap_windows={1: set(range(274, 285))},
+            )
+            reference_output = root / "reference" / "prepared.jsonl"
+            reference_manifest = root / "reference" / "manifest.json"
+            self.write_reference(archives, reference_output, reference_manifest)
+
+            resumed_output = root / "resumed" / "prepared.jsonl"
+            resumed_manifest = root / "resumed" / "manifest.json"
+            arguments = self.prepare_arguments(
+                archives, resumed_output, resumed_manifest
+            )
+            with self.interrupt_after_checkpoint(3), self.assertRaisesRegex(
+                RuntimeError, "archive 3"
+            ):
+                prepare_archives(**arguments)
+            prepare_archives(**arguments)
+
+            self.assertEqual(resumed_output.read_bytes(), reference_output.read_bytes())
+            resumed_rows = [
+                json.loads(line)
+                for line in resumed_output.read_text(encoding="utf-8").splitlines()
+            ]
+            windows = {str(row["windowStart"]) for row in resumed_rows}
+            self.assertNotIn("2025-01-03T00:45:00.000Z", windows)
+            self.assertIn("2025-01-03T00:50:00.000Z", windows)
+
+    def test_gap_manifest_and_checkpoint_tampering_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archives = self.build_daily_archives(
+                root / "archives", gap_windows={1: {138, 139, 140}}
+            )
+            reference_output = root / "reference" / "prepared.jsonl"
+            reference_manifest = root / "reference" / "manifest.json"
+            self.write_reference(archives, reference_output, reference_manifest)
+            manifest_value = json.loads(
+                reference_manifest.read_text(encoding="utf-8")
+            )
+            mutations = {
+                "ordered": list(reversed(manifest_value["gapWindowStarts"])),
+                "aligned": [
+                    "2025-01-02T11:30:01.000Z",
+                    *manifest_value["gapWindowStarts"][1:],
+                ],
+                "source range": [
+                    "2024-12-31T23:55:00.000Z",
+                    *manifest_value["gapWindowStarts"][1:],
+                ],
+                "daily edge": [
+                    "2025-01-02T00:00:00.000Z",
+                    *manifest_value["gapWindowStarts"][1:],
+                ],
+            }
+            for expected, gap_values in mutations.items():
+                with self.subTest(expected=expected):
+                    tampered = json.loads(json.dumps(manifest_value))
+                    tampered["gapWindowStarts"] = gap_values
+                    with self.assertRaisesRegex(ValueError, expected):
+                        validate_dataset_manifest(tampered)
+
+            output = root / "resumed" / "prepared.jsonl"
+            manifest = root / "resumed" / "manifest.json"
+            arguments = self.prepare_arguments(archives, output, manifest)
+            with self.interrupt_after_checkpoint(2), self.assertRaises(RuntimeError):
+                prepare_archives(**arguments)
+            checkpoint_path = (
+                pipeline_module.archive_checkpoint_root(output)
+                / "archives"
+                / "00000002"
+                / "checkpoint.json"
+            )
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            checkpoint["gapWindowStarts"] = []
+            identity = dict(checkpoint)
+            identity.pop("checkpointSha256")
+            checkpoint["checkpointSha256"] = (
+                pipeline_module.checkpoint_identity_sha256(identity)
+            )
+            checkpoint_path.write_text(
+                json.dumps(checkpoint, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "gap lineage does not match"):
+                prepare_archives(**arguments)
+            self.assertFalse(output.exists())
+            self.assertFalse(manifest.exists())
+
+    def test_hash_coherent_training_corpus_cannot_reinsert_poisoned_window(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            gapped_archives = self.build_daily_archives(
+                root / "gapped-archives", gap_windows={1: {138, 139, 140}}
+            )
+            complete_archives = self.build_daily_archives(root / "complete-archives")
+            gapped_output = root / "gapped" / "prepared.jsonl"
+            gapped_manifest = root / "gapped" / "manifest.json"
+            self.write_reference(gapped_archives, gapped_output, gapped_manifest)
+            complete_output = root / "complete" / "prepared.jsonl"
+            complete_manifest = root / "complete" / "manifest.json"
+            self.write_reference(
+                complete_archives, complete_output, complete_manifest
+            )
+
+            poison_window = "2025-01-02T11:30:00.000Z"
+            replaced_window = "2025-01-02T18:00:00.000Z"
+            gapped_rows = [
+                json.loads(line)
+                for line in gapped_output.read_text(encoding="utf-8").splitlines()
+            ]
+            injected_rows = [
+                json.loads(line)
+                for line in complete_output.read_text(encoding="utf-8").splitlines()
+                if json.loads(line)["windowStart"] == poison_window
+            ]
+            self.assertEqual(len(injected_rows), 3)
+            tampered_rows = [
+                row for row in gapped_rows if row["windowStart"] != replaced_window
+            ] + injected_rows
+            tampered_rows.sort(key=lambda row: (str(row["decisionAt"]), str(row["id"])))
+            self.assertEqual(len(tampered_rows), len(gapped_rows))
+            tampered_output = root / "tampered" / "prepared.jsonl"
+            tampered_output.parent.mkdir(parents=True)
+            tampered_output.write_text(
+                "".join(canonical_json(row) + "\n" for row in tampered_rows),
+                encoding="utf-8",
+                newline="\n",
+            )
+            tampered_manifest_value = json.loads(
+                gapped_manifest.read_text(encoding="utf-8")
+            )
+            tampered_manifest_value["preparedDatasetSha256"] = hashlib.sha256(
+                tampered_output.read_bytes()
+            ).hexdigest()
+            validate_dataset_manifest(tampered_manifest_value)
+            tampered_manifest = root / "tampered" / "manifest.json"
+            tampered_manifest.write_text(
+                json.dumps(tampered_manifest_value, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "depends on a declared source gap"):
+                pipeline_module.train_draft(
+                    input_path=tampered_output,
+                    manifest_path=tampered_manifest,
+                    output_path=root / "tampered" / "artifact.json",
+                    evaluation_path=root / "tampered" / "evaluation.json",
+                    signal_type="FIVE_MINUTE_EARLY_DIRECTION",
+                    version="gap-tamper-test",
+                    deadband_bps=DEFAULT_DEADBAND_BPS,
+                    confidence_threshold=0.75,
+                    validity_days=120,
+                )
 
     def test_corrupt_chunk_and_checkpoint_schema_fail_closed(self) -> None:
         for corruption in ("chunk", "schema"):

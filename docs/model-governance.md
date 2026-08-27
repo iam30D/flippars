@@ -20,7 +20,8 @@ production signal type.
 
 No live process may update weights or promote a candidate automatically.
 
-For `flippars.multinomial-candidate/3`, the artifact additionally binds the
+For historical `flippars.multinomial-candidate/3` and gap-aware
+`flippars.multinomial-candidate/4`, the artifact additionally binds the
 Binance Spot trade target, signal-specific duration, label deadband, exact
 candidate offsets/cadence/lead floor, 24-feature order, full three-class
 probabilities, canonical dataset-content and manifest digests, and separate

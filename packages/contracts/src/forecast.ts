@@ -530,10 +530,18 @@ const CanonicalUtcDateSchema = z
       !Number.isNaN(parsed.valueOf()) && parsed.toISOString().slice(0, 10) === value
     );
   }, "Date must be a canonical UTC calendar date");
+const NonNegativeSafeIntegerSchema = z
+  .number()
+  .int()
+  .nonnegative()
+  .max(Number.MAX_SAFE_INTEGER);
 
 export const DatasetManifestSummarySchema = z
   .object({
-    schemaVersion: z.literal("flippars.dataset-manifest-summary/3"),
+    schemaVersion: z.union([
+      z.literal("flippars.dataset-manifest-summary/3"),
+      z.literal("flippars.dataset-manifest-summary/4"),
+    ]),
     datasetContentSha256: Sha256HexSchema,
     datasetManifestSha256: Sha256HexSchema,
     lineageKind: z.enum([
@@ -556,25 +564,25 @@ export const DatasetManifestSummarySchema = z
     sourceIntegrityRequired: z.literal(true),
     crossVenueGuardAvailability: z.literal("UNAVAILABLE"),
     productionEligible: z.literal(false),
-    archiveCount: z.number().int().nonnegative(),
+    archiveCount: NonNegativeSafeIntegerSchema,
     archiveChecksumsVerified: z.boolean(),
     officialTransportEvidenceVerified: z.boolean(),
     sourceStartDateInclusive: CanonicalUtcDateSchema.nullable(),
     sourceEndDateExclusive: CanonicalUtcDateSchema.nullable(),
-    sourceDayCount: z.number().int().nonnegative(),
+    sourceDayCount: NonNegativeSafeIntegerSchema,
     startAt: Rfc3339TimestampSchema,
     endAt: Rfc3339TimestampSchema,
-    acceptedTradeCount: z.number().int().nonnegative(),
-    rejectedTradeCount: z.number().int().nonnegative(),
-    gapCount: z.number().int().nonnegative(),
-    duplicateTradeCount: z.number().int().nonnegative(),
-    preparedWindowCount: z.number().int().nonnegative(),
-    preparedDecisionRowCount: z.number().int().nonnegative(),
+    acceptedTradeCount: NonNegativeSafeIntegerSchema,
+    rejectedTradeCount: NonNegativeSafeIntegerSchema,
+    gapCount: NonNegativeSafeIntegerSchema,
+    duplicateTradeCount: NonNegativeSafeIntegerSchema,
+    preparedWindowCount: NonNegativeSafeIntegerSchema,
+    preparedDecisionRowCount: NonNegativeSafeIntegerSchema,
     partitionWindowCounts: z
       .object({
-        modelFit: z.number().int().nonnegative(),
-        calibration: z.number().int().nonnegative(),
-        evaluation: z.number().int().nonnegative(),
+        modelFit: NonNegativeSafeIntegerSchema,
+        calibration: NonNegativeSafeIntegerSchema,
+        evaluation: NonNegativeSafeIntegerSchema,
       })
       .strict(),
   })
@@ -593,6 +601,16 @@ export const DatasetManifestSummarySchema = z
       });
     }
     const isPublic = manifest.lineageKind === "PUBLIC_BINANCE_ARCHIVE";
+    if (
+      manifest.schemaVersion === "flippars.dataset-manifest-summary/3" &&
+      manifest.gapCount !== 0
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["gapCount"],
+        message: "Dataset manifest summary V3 is gap-free",
+      });
+    }
     if (
       manifest.archiveChecksumsVerified !== isPublic ||
       manifest.officialTransportEvidenceVerified !== isPublic ||
@@ -614,14 +632,13 @@ export const DatasetManifestSummarySchema = z
       (manifest.archiveCount === 0 ||
         manifest.acceptedTradeCount === 0 ||
         manifest.rejectedTradeCount !== 0 ||
-        manifest.gapCount !== 0 ||
         manifest.duplicateTradeCount !== 0)
     ) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
         path: ["lineageKind"],
         message:
-          "Public Binance lineage requires nonempty, rejection-free, gap-free, duplicate-free source data",
+          "Public Binance lineage requires nonempty, rejection-free, duplicate-free source data",
       });
     }
     if (manifest.sourceDayCount !== manifest.archiveCount) {
@@ -684,6 +701,20 @@ export const DatasetManifestSummarySchema = z
     }
   });
 
+export const DatasetManifestSummaryV3Schema = DatasetManifestSummarySchema.refine(
+  (manifest) => manifest.schemaVersion === "flippars.dataset-manifest-summary/3",
+  {
+    path: ["schemaVersion"],
+    message: "Expected dataset manifest summary V3",
+  },
+);
+export const DatasetManifestSummaryV4Schema = DatasetManifestSummarySchema.refine(
+  (manifest) => manifest.schemaVersion === "flippars.dataset-manifest-summary/4",
+  {
+    path: ["schemaVersion"],
+    message: "Expected dataset manifest summary V4",
+  },
+);
 export type DatasetManifestSummary = z.infer<typeof DatasetManifestSummarySchema>;
 
 const CanonicalNonNegativeDecimalStringSchema = z

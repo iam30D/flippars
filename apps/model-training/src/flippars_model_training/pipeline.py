@@ -20,6 +20,7 @@ import os
 import platform
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import urllib.error
@@ -48,12 +49,12 @@ SIGNAL_DURATION_SECONDS = {
     "FIVE_MINUTE_EARLY_DIRECTION": 300,
 }
 CLASS_ORDER = ("ABOVE_OPEN", "BELOW_OPEN", "AT_OPEN")
-ARTIFACT_SCHEMA_VERSION = "flippars.multinomial-candidate/3"
+ARTIFACT_SCHEMA_VERSION = "flippars.multinomial-candidate/4"
 DATASET_SCHEMA_VERSION = "flippars.training-dataset/3"
-DATASET_MANIFEST_SCHEMA_VERSION = "flippars.dataset-manifest/2"
-DATASET_MANIFEST_SUMMARY_SCHEMA_VERSION = "flippars.dataset-manifest-summary/3"
+DATASET_MANIFEST_SCHEMA_VERSION = "flippars.dataset-manifest/3"
+DATASET_MANIFEST_SUMMARY_SCHEMA_VERSION = "flippars.dataset-manifest-summary/4"
 ARCHIVE_PREPARATION_PLAN_SCHEMA_VERSION = "flippars.archive-preparation-plan/1"
-ARCHIVE_PREPARATION_CHECKPOINT_SCHEMA_VERSION = "flippars.archive-preparation-checkpoint/1"
+ARCHIVE_PREPARATION_CHECKPOINT_SCHEMA_VERSION = "flippars.archive-preparation-checkpoint/2"
 FEATURE_SCHEMA_VERSION = "binance-spot-signal-features/1"
 LABEL_POLICY_VERSION = "binance-spot-trade-close-relation/1"
 DECISION_POLICY_VERSION = "flippars-signal-candidate-sampling/1"
@@ -234,6 +235,27 @@ def main() -> None:
         )
         print(json.dumps(result, indent=2))
         return
+    if args.command == "preflight-archive-resume":
+        archives = select_offline_archives(
+            Path(args.archive_root),
+            date.fromisoformat(args.start),
+            date.fromisoformat(args.end),
+        )
+        result = preflight_archive_resume(
+            archives=archives,
+            output=Path(args.output),
+            manifest_output=Path(args.manifest_output),
+            signal_type=args.signal_type,
+            deadband_bps=args.deadband_bps,
+            timeframe_minutes=args.timeframe_minutes,
+            decision_cadence_seconds=args.decision_cadence_seconds,
+            minimum_lead_time_seconds=args.minimum_lead_time_seconds,
+            acquisition_manifest_path=(
+                Path(args.acquisition_manifest) if args.acquisition_manifest else None
+            ),
+        )
+        print(json.dumps(result, separators=(",", ":")))
+        return
     if args.command == "train":
         result = train_draft(
             input_path=Path(args.input),
@@ -282,6 +304,18 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_archives_command.add_argument("--manifest-output", required=True)
     prepare_archives_command.add_argument("--acquisition-manifest")
     _add_dataset_arguments(prepare_archives_command)
+
+    preflight_archive_resume_command = commands.add_parser(
+        "preflight-archive-resume",
+        help="Read-only full admission check for one durable archive-preparation resume.",
+    )
+    preflight_archive_resume_command.add_argument("--archive-root", required=True)
+    preflight_archive_resume_command.add_argument("--start", required=True)
+    preflight_archive_resume_command.add_argument("--end", required=True)
+    preflight_archive_resume_command.add_argument("--output", required=True)
+    preflight_archive_resume_command.add_argument("--manifest-output", required=True)
+    preflight_archive_resume_command.add_argument("--acquisition-manifest")
+    _add_dataset_arguments(preflight_archive_resume_command)
 
     train = commands.add_parser("train", help="Fit, calibrate, replay, and write a v3 DRAFT artifact.")
     train.add_argument("--input", required=True)
@@ -423,6 +457,172 @@ def prepare_archives(
     )
 
 
+def preflight_archive_resume(
+    *,
+    archives: Sequence[Path],
+    output: Path,
+    manifest_output: Path,
+    signal_type: str,
+    deadband_bps: float,
+    timeframe_minutes: int | None,
+    decision_cadence_seconds: int,
+    minimum_lead_time_seconds: int | None,
+    acquisition_manifest_path: Path | None = None,
+) -> dict[str, object]:
+    """Validate one durable resume state without changing any file."""
+    duration_seconds = SIGNAL_DURATION_SECONDS.get(signal_type)
+    expected_minutes = (duration_seconds or 0) // 60
+    if timeframe_minutes is None:
+        timeframe_minutes = expected_minutes
+    if minimum_lead_time_seconds is None:
+        minimum_lead_time_seconds = SIGNAL_MINIMUM_LEAD_TIME_SECONDS[signal_type]
+    options = DatasetOptions(
+        signal_type=signal_type,
+        deadband_bps=deadband_bps,
+        timeframe_minutes=timeframe_minutes,
+        decision_cadence_seconds=decision_cadence_seconds,
+        minimum_lead_time_seconds=minimum_lead_time_seconds,
+    )
+    validate_dataset_options(options)
+    ordered_archives = sorted(archives)
+    if not ordered_archives:
+        raise ValueError("At least one verified archive is required")
+    archive_days = [
+        date.fromisoformat(ARCHIVE_PATTERN.fullmatch(path.name).group("day"))
+        if ARCHIVE_PATTERN.fullmatch(path.name)
+        else None
+        for path in ordered_archives
+    ]
+    if any(day is None for day in archive_days):
+        raise ValueError("Every source archive must use the governed BTCUSDT daily filename")
+    typed_archive_days = [day for day in archive_days if day is not None]
+    if any(
+        current != previous + timedelta(days=1)
+        for previous, current in zip(typed_archive_days, typed_archive_days[1:])
+    ):
+        raise ValueError("Source archive dates must form one contiguous UTC range")
+
+    checkpoint_root = archive_checkpoint_root(output)
+    if checkpoint_root.is_symlink() or not checkpoint_root.is_dir():
+        raise ValueError("Resume preflight requires a real archive checkpoint root")
+    checkpoint_root_names = {entry.name for entry in checkpoint_root.iterdir()}
+    if checkpoint_root_names != {"archives", "plan.json"}:
+        raise ValueError(
+            "Resume preflight checkpoint root must contain only archives and plan.json"
+        )
+    archives_root = checkpoint_root / "archives"
+    plan_path = checkpoint_root / "plan.json"
+    if archives_root.is_symlink() or not archives_root.is_dir():
+        raise ValueError("Resume preflight requires a real checkpoint archives directory")
+    if plan_path.is_symlink() or not plan_path.is_file():
+        raise ValueError("Resume preflight requires a regular durable plan")
+
+    expected_plan = build_archive_preparation_plan(
+        archives=ordered_archives,
+        output=output,
+        manifest_output=manifest_output,
+        options=options,
+        acquisition_manifest_path=acquisition_manifest_path,
+    )
+    actual_plan, _ = read_json_object_and_sha256(plan_path)
+    if actual_plan != expected_plan:
+        raise ValueError("Resume preflight plan does not match current immutable inputs")
+    checkpoints = load_archive_checkpoints(
+        archives_root=archives_root,
+        expected_plan=expected_plan,
+        discard_abandoned_temporaries=False,
+    )
+    if not checkpoints:
+        raise ValueError("Resume preflight requires at least one durable daily checkpoint")
+
+    output_exists = output.exists()
+    manifest_exists = manifest_output.exists()
+    if manifest_exists and not output_exists:
+        raise ValueError("Resume preflight rejects a manifest without its prepared dataset")
+    if output_exists and (output.is_symlink() or not output.is_file()):
+        raise ValueError("Resume preflight prepared output is not a regular file")
+    if manifest_exists and (
+        manifest_output.is_symlink() or not manifest_output.is_file()
+    ):
+        raise ValueError("Resume preflight dataset manifest is not a regular file")
+    checkpoints_complete = len(checkpoints) == len(ordered_archives)
+    if output_exists and not checkpoints_complete:
+        raise ValueError("Published resume output requires every archive checkpoint")
+    remove_abandoned_finalization_temporaries(
+        (output, manifest_output),
+        checkpoint_root_was_present=True,
+        checkpoints_complete=checkpoints_complete,
+        remove=False,
+    )
+
+    last_record, expected_report, _ = checkpoints[-1]
+    previous_state = last_record["previousState"]
+    if not isinstance(previous_state, dict):
+        raise ValueError("Resume preflight checkpoint previous state is invalid")
+    before_id = checkpoint_optional_string(
+        previous_state["lastTradeId"], "lastTradeId"
+    )
+    before_event = checkpoint_optional_string(
+        previous_state["lastEventAt"], "lastEventAt"
+    )
+    rebuilt_report, _, _, rebuilt_gaps = prepare_archive_batch(
+        archive_path=ordered_archives[len(checkpoints) - 1],
+        options=options,
+        history_tail=[],
+        previous_day_last_id=before_id,
+        previous_day_last_event=parse_timestamp(before_event) if before_event else None,
+    )
+    if asdict(rebuilt_report) != asdict(expected_report):
+        raise ValueError("Resume preflight cannot reconstruct the latest source checkpoint")
+    if last_record.get("gapWindowStarts") != [
+        format_timestamp(value) for value in rebuilt_gaps
+    ]:
+        raise ValueError("Resume preflight latest source gap lineage does not match")
+
+    inputs = expected_plan["inputs"]
+    if not isinstance(inputs, dict) or not isinstance(inputs.get("archives"), list):
+        raise ValueError("Resume preflight plan inputs are invalid")
+    archive_inputs = inputs["archives"]
+    if len(checkpoints) < len(ordered_archives):
+        next_archive = ordered_archives[len(checkpoints)]
+        next_archive_input = archive_inputs[len(checkpoints)]
+        if not isinstance(next_archive_input, dict):
+            raise ValueError("Resume preflight next archive plan record is invalid")
+        if sha256_file(next_archive) != next_archive_input.get("expectedSha256"):
+            raise ValueError("Resume preflight next source archive digest mismatch")
+
+    final_plan = build_archive_preparation_plan(
+        archives=ordered_archives,
+        output=output,
+        manifest_output=manifest_output,
+        options=options,
+        acquisition_manifest_path=acquisition_manifest_path,
+    )
+    if final_plan != expected_plan:
+        raise ValueError("Resume preflight inputs changed during validation")
+    reports = [report for _, report, _ in checkpoints]
+    if output_exists:
+        validate_published_output_against_checkpoints(output, checkpoints)
+    if manifest_exists:
+        validate_completed_dataset_manifest(
+            output=output,
+            manifest_output=manifest_output,
+            checkpoints=checkpoints,
+            reports=reports,
+            options=options,
+            acquisition_manifest_path=acquisition_manifest_path,
+        )
+    return {
+        "schemaVersion": "flippars.archive-resume-admission/1",
+        "state": "ArchivePreparation",
+        "archiveCount": len(ordered_archives),
+        "checkpointCount": len(checkpoints),
+        "preparedOutputPresent": output_exists,
+        "datasetManifestPresent": manifest_exists,
+        "readOnly": True,
+    }
+
+
 def archive_checkpoint_root(output: Path) -> Path:
     return output.parent / f".{output.name}.archive-checkpoints"
 
@@ -540,6 +740,90 @@ def checkpoint_identity_sha256(value: dict[str, object]) -> str:
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def validate_aligned_gap_window_starts(
+    value: object,
+    label: str,
+    *,
+    duration_seconds: int,
+    range_start: datetime,
+    range_end: datetime,
+    require_complete_daily_edges: bool,
+) -> list[datetime]:
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be an array")
+    if duration_seconds <= 0 or 86_400 % duration_seconds != 0:
+        raise ValueError(f"{label} uses an invalid aligned duration")
+    if range_start.tzinfo is None or range_end.tzinfo is None or range_start >= range_end:
+        raise ValueError(f"{label} uses an invalid UTC range")
+    texts: list[str] = []
+    parsed: list[datetime] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, str) or not item:
+            raise ValueError(f"{label}[{index}] must be a non-empty timestamp string")
+        try:
+            timestamp = parse_timestamp(item)
+        except ValueError as error:
+            raise ValueError(f"{label}[{index}] is invalid") from error
+        if format_timestamp(timestamp) != item:
+            raise ValueError(f"{label}[{index}] is not canonical")
+        if timestamp.microsecond != 0 or int(timestamp.timestamp()) % duration_seconds != 0:
+            raise ValueError(f"{label}[{index}] is not aligned to the signal duration")
+        if not range_start <= timestamp < range_end:
+            raise ValueError(f"{label}[{index}] falls outside its source range")
+        if require_complete_daily_edges:
+            day_start = datetime(
+                timestamp.year, timestamp.month, timestamp.day, tzinfo=UTC
+            )
+            if timestamp == day_start or timestamp + timedelta(
+                seconds=duration_seconds
+            ) == day_start + timedelta(days=1):
+                raise ValueError(f"{label}[{index}] would hide an incomplete daily edge")
+        texts.append(item)
+        parsed.append(timestamp)
+    if texts != sorted(set(texts)):
+        raise ValueError(f"{label} must be canonical, strictly ordered, and unique")
+    return parsed
+
+
+def contiguous_candle_tail(
+    candles: Sequence[Candle], *, maximum: int = 13
+) -> list[Candle]:
+    if maximum < 1 or not candles:
+        return []
+    start = len(candles) - 1
+    while start > 0 and len(candles) - start < maximum:
+        if candles[start - 1].end != candles[start].start:
+            break
+        start -= 1
+    return list(candles[start:])[-maximum:]
+
+
+def missing_aligned_candle_windows(
+    candles: Sequence[Candle], *, duration_seconds: int
+) -> list[datetime]:
+    gaps: list[datetime] = []
+    for previous, target in zip(candles, candles[1:]):
+        if previous.end == target.start:
+            continue
+        if previous.end > target.start:
+            raise ValueError("Candle sequence overlaps or regresses")
+        cursor = previous.end
+        while cursor < target.start:
+            gaps.append(cursor)
+            cursor += timedelta(seconds=duration_seconds)
+    return gaps
+
+
+def gap_poisoned_window_starts(
+    gap_starts: Sequence[datetime], *, duration_seconds: int
+) -> set[str]:
+    return {
+        format_timestamp(gap + timedelta(seconds=offset * duration_seconds))
+        for gap in gap_starts
+        for offset in range(14)
+    }
 
 
 def initialize_archive_checkpoint_store(
@@ -814,6 +1098,7 @@ def validate_archive_checkpoint(
             "archiveInput",
             "previousState",
             "nextState",
+            "gapWindowStarts",
             "rows",
             "report",
         ),
@@ -857,6 +1142,16 @@ def validate_archive_checkpoint(
     plan_archives = plan_inputs["archives"]
     if not isinstance(plan_archives, list):
         raise ValueError("Archive checkpoint plan archives must be an array")
+    options_value = require_exact_checkpoint_keys(
+        plan_inputs["options"],
+        tuple(DatasetOptions.__dataclass_fields__),
+        "archive checkpoint plan options",
+    )
+    try:
+        options = DatasetOptions(**options_value)
+        validate_dataset_options(options)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Archive checkpoint plan options are invalid") from error
     if checkpoint_integer(record["archiveCount"], "archiveCount", minimum=1) != len(
         plan_archives
     ):
@@ -898,6 +1193,16 @@ def validate_archive_checkpoint(
         or report.missing_trade_id_count != 0
     ):
         raise ValueError("Archive checkpoint report does not match its immutable input")
+    report_day = date.fromisoformat(report.day)
+    day_start = datetime(report_day.year, report_day.month, report_day.day, tzinfo=UTC)
+    validate_aligned_gap_window_starts(
+        record["gapWindowStarts"],
+        "archive checkpoint gapWindowStarts",
+        duration_seconds=SIGNAL_DURATION_SECONDS[options.signal_type],
+        range_start=day_start,
+        range_end=day_start + timedelta(days=1),
+        require_complete_daily_edges=True,
+    )
     rows = require_exact_checkpoint_keys(
         record["rows"],
         (
@@ -961,17 +1266,43 @@ def validate_archive_checkpoint(
     return record, report, observed_last_key, observed_last_window
 
 
+def assert_real_directory_tree(path: Path, label: str) -> None:
+    pending = [path]
+    while pending:
+        current = pending.pop()
+        for entry in current.iterdir():
+            metadata = entry.lstat()
+            file_attributes = int(getattr(metadata, "st_file_attributes", 0))
+            reparse_attribute = int(
+                getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            )
+            if stat.S_ISLNK(metadata.st_mode) or (
+                reparse_attribute and file_attributes & reparse_attribute
+            ):
+                raise ValueError(f"{label} contains a link or reparse point")
+            if entry.is_dir():
+                pending.append(entry)
+
+
 def load_archive_checkpoints(
     *,
     archives_root: Path,
     expected_plan: dict[str, object],
+    discard_abandoned_temporaries: bool = True,
 ) -> list[tuple[dict[str, object], ArchiveReport, Path]]:
+    entries_to_validate: list[Path] = []
     for entry in list(archives_root.iterdir()):
         if ARCHIVE_CHECKPOINT_TEMPORARY_PATTERN.fullmatch(entry.name) is not None:
             if entry.is_symlink() or not entry.is_dir():
                 raise ValueError("Invalid abandoned archive checkpoint temporary entry")
-            shutil.rmtree(entry)
-    entries = sorted(archives_root.iterdir(), key=lambda path: path.name)
+            assert_real_directory_tree(
+                entry, "Abandoned archive checkpoint temporary entry"
+            )
+            if discard_abandoned_temporaries:
+                shutil.rmtree(entry)
+            continue
+        entries_to_validate.append(entry)
+    entries = sorted(entries_to_validate, key=lambda path: path.name)
     if any(
         entry.is_symlink()
         or not entry.is_dir()
@@ -1039,6 +1370,31 @@ def load_archive_checkpoints(
     return checkpoints
 
 
+def collect_checkpoint_gap_window_starts(
+    checkpoints: Sequence[tuple[dict[str, object], ArchiveReport, Path]],
+    options: DatasetOptions,
+) -> list[datetime]:
+    duration_seconds = SIGNAL_DURATION_SECONDS[options.signal_type]
+    result: list[datetime] = []
+    for record, report, _ in checkpoints:
+        report_day = date.fromisoformat(report.day)
+        day_start = datetime(report_day.year, report_day.month, report_day.day, tzinfo=UTC)
+        result.extend(
+            validate_aligned_gap_window_starts(
+                record.get("gapWindowStarts"),
+                f"Archive {report.archive} checkpoint gapWindowStarts",
+                duration_seconds=duration_seconds,
+                range_start=day_start,
+                range_end=day_start + timedelta(days=1),
+                require_complete_daily_edges=True,
+            )
+        )
+    texts = [format_timestamp(value) for value in result]
+    if texts != sorted(set(texts)):
+        raise ValueError("Archive checkpoint gaps must be globally ordered and unique")
+    return result
+
+
 def prepare_archive_batch(
     *,
     archive_path: Path,
@@ -1046,7 +1402,7 @@ def prepare_archive_batch(
     history_tail: Sequence[Candle],
     previous_day_last_id: str | None,
     previous_day_last_event: datetime | None,
-) -> tuple[ArchiveReport, list[Candle], list[dict[str, object]]]:
+) -> tuple[ArchiveReport, list[Candle], list[dict[str, object]], list[datetime]]:
     report, candles = stream_archive_candles(
         archive_path,
         options,
@@ -1067,27 +1423,25 @@ def prepare_archive_batch(
             "source corpus is quarantined"
         )
     sequence = list(history_tail) + candles
-    gaps: list[datetime] = []
     duration_seconds = SIGNAL_DURATION_SECONDS[options.signal_type]
-    for previous, target in zip(sequence, sequence[1:]):
-        if previous.end == target.start:
-            continue
-        cursor = previous.end
-        while cursor < target.start:
-            gaps.append(cursor)
-            cursor += timedelta(seconds=duration_seconds)
-    if gaps:
-        raise ValueError(
-            f"Detected {len(gaps)} missing aligned candle windows; "
-            "quarantine and repair source coverage"
-        )
+    gaps = missing_aligned_candle_windows(
+        sequence, duration_seconds=duration_seconds
+    )
+    validate_aligned_gap_window_starts(
+        [format_timestamp(gap) for gap in gaps],
+        f"Archive {report.archive} gapWindowStarts",
+        duration_seconds=duration_seconds,
+        range_start=expected_day_start,
+        range_end=expected_day_start + timedelta(days=1),
+        require_complete_daily_edges=True,
+    )
     owned_window_starts = {format_timestamp(candle.start) for candle in candles}
     rows = [
         row
         for row in examples_from_candles(sequence, options)
         if str(row["windowStart"]) in owned_window_starts
     ]
-    return report, candles, rows
+    return report, candles, rows, gaps
 
 
 def write_archive_checkpoint(
@@ -1098,6 +1452,7 @@ def write_archive_checkpoint(
     archive_index: int,
     archive_count: int,
     rows: Sequence[dict[str, object]],
+    gap_starts: Sequence[datetime],
     report: ArchiveReport,
     previous_id: str | None,
     previous_event: str | None,
@@ -1159,6 +1514,7 @@ def write_archive_checkpoint(
                 "lastTradeId": report.last_trade_id,
                 "lastEventAt": report.last_event_at,
             },
+            "gapWindowStarts": [format_timestamp(value) for value in gap_starts],
             "rows": {
                 "path": "rows.jsonl",
                 "bytes": byte_count,
@@ -1207,6 +1563,26 @@ def iter_checkpoint_rows(
             raise ValueError("Archive checkpoint row count mismatch")
 
 
+def iter_gap_abstaining_rows(
+    rows: Iterable[dict[str, object]],
+    gap_starts: Sequence[datetime],
+    options: DatasetOptions,
+) -> Iterator[dict[str, object]]:
+    forbidden = gap_poisoned_window_starts(
+        gap_starts,
+        duration_seconds=SIGNAL_DURATION_SECONDS[options.signal_type],
+    )
+    for row in rows:
+        window = row.get("windowStart")
+        if not isinstance(window, str) or not window:
+            raise ValueError("Prepared row is missing its windowStart")
+        if window in forbidden:
+            raise ValueError(
+                f"Prepared window {window} depends on a declared source gap"
+            )
+        yield row
+
+
 def validate_published_output_against_checkpoints(
     output: Path,
     checkpoints: Sequence[tuple[dict[str, object], ArchiveReport, Path]],
@@ -1242,6 +1618,7 @@ def remove_abandoned_finalization_temporaries(
     *,
     checkpoint_root_was_present: bool,
     checkpoints_complete: bool,
+    remove: bool = True,
 ) -> None:
     candidates: list[Path] = []
     for target in targets:
@@ -1265,8 +1642,9 @@ def remove_abandoned_finalization_temporaries(
             candidates.append(entry)
     if candidates and (not checkpoint_root_was_present or not checkpoints_complete):
         raise ValueError("Abandoned finalization temporaries lack complete checkpoints")
-    for candidate in candidates:
-        candidate.unlink()
+    if remove:
+        for candidate in candidates:
+            candidate.unlink()
 
 
 def validate_completed_dataset_manifest(
@@ -1338,6 +1716,8 @@ def validate_completed_dataset_manifest(
     }
     if any(source.get(key) != value for key, value in source_bindings.items()):
         raise ValueError("Completed dataset manifest source binding mismatch")
+    gap_starts = collect_checkpoint_gap_window_starts(checkpoints, options)
+    gap_window_starts = [format_timestamp(value) for value in gap_starts]
     output_sha256 = sha256_file(output)
     expected_bindings = {
         "target": target_contract_for_options(options),
@@ -1346,8 +1726,8 @@ def validate_completed_dataset_manifest(
         "endAt": last_window_end,
         "acceptedTradeCount": sum(report.accepted_trade_count for report in reports),
         "rejectedTradeCount": sum(report.rejected_trade_count for report in reports),
-        "gapCount": 0,
-        "gapWindowStarts": [],
+        "gapCount": len(gap_window_starts),
+        "gapWindowStarts": gap_window_starts,
         "duplicateTradeCount": sum(report.duplicate_trade_count for report in reports),
         "preparedDecisionRowCount": row_count,
         "preparedWindowCount": window_count,
@@ -1363,7 +1743,7 @@ def validate_completed_dataset_manifest(
         "output": str(output.resolve()),
         "manifest": str(manifest_output.resolve()),
         "datasetContentSha256": output_sha256,
-        "gapCount": 0,
+        "gapCount": len(gap_window_starts),
         "rejectedTradeCount": expected_bindings["rejectedTradeCount"],
         "duplicateTradeCount": expected_bindings["duplicateTradeCount"],
     }
@@ -1444,7 +1824,7 @@ def write_resumable_archive_dataset(
             raise ValueError("Archive checkpoint state is invalid")
         before_id = checkpoint_optional_string(previous_state["lastTradeId"], "lastTradeId")
         before_event = checkpoint_optional_string(previous_state["lastEventAt"], "lastEventAt")
-        rebuilt_report, rebuilt_candles, _ = prepare_archive_batch(
+        rebuilt_report, rebuilt_candles, _, rebuilt_gaps = prepare_archive_batch(
             archive_path=archives[len(checkpoints) - 1],
             options=options,
             history_tail=[],
@@ -1453,9 +1833,11 @@ def write_resumable_archive_dataset(
         )
         if asdict(rebuilt_report) != asdict(expected_report):
             raise ValueError("Last archive checkpoint cannot reconstruct its source state")
-        if len(rebuilt_candles) < 13:
-            raise ValueError("Last archive checkpoint cannot reconstruct required feature history")
-        history_tail = rebuilt_candles[-13:]
+        expected_gap_starts = last_record.get("gapWindowStarts")
+        rebuilt_gap_starts = [format_timestamp(value) for value in rebuilt_gaps]
+        if expected_gap_starts != rebuilt_gap_starts:
+            raise ValueError("Last archive checkpoint gap lineage does not match its source")
+        history_tail = contiguous_candle_tail(rebuilt_candles)
         previous_id = checkpoint_optional_string(next_state["lastTradeId"], "lastTradeId")
         previous_event = checkpoint_optional_string(next_state["lastEventAt"], "lastEventAt")
         previous_checkpoint_sha256 = checkpoint_optional_string(
@@ -1480,7 +1862,7 @@ def write_resumable_archive_dataset(
         )
     for archive_index in range(len(checkpoints) + 1, len(archives) + 1):
         archive_path = archives[archive_index - 1]
-        report, candles, rows = prepare_archive_batch(
+        report, candles, rows, gaps = prepare_archive_batch(
             archive_path=archive_path,
             options=options,
             history_tail=history_tail,
@@ -1494,6 +1876,7 @@ def write_resumable_archive_dataset(
             archive_index=archive_index,
             archive_count=len(archives),
             rows=rows,
+            gap_starts=gaps,
             report=report,
             previous_id=previous_id,
             previous_event=previous_event,
@@ -1503,7 +1886,7 @@ def write_resumable_archive_dataset(
         )
         reports.append(report)
         checkpoints.append((record, report, archives_root / f"{archive_index:08d}" / "rows.jsonl"))
-        history_tail = (history_tail + candles)[-13:]
+        history_tail = contiguous_candle_tail(history_tail + candles)
         previous_id = report.last_trade_id
         previous_event = report.last_event_at
         previous_checkpoint_sha256 = checkpoint_optional_string(
@@ -1556,12 +1939,15 @@ def write_resumable_archive_dataset(
             file=sys.stderr,
             flush=True,
         )
+    gap_starts = collect_checkpoint_gap_window_starts(checkpoints, options)
     result = write_prepared_dataset(
-        rows=iter_checkpoint_rows(checkpoints),
+        rows=iter_gap_abstaining_rows(
+            iter_checkpoint_rows(checkpoints), gap_starts, options
+        ),
         trades_accepted=None,
         cross_file_duplicates=0,
         reports=reports,
-        gap_starts=[],
+        gap_starts=gap_starts,
         output=output,
         manifest_output=manifest_output,
         options=options,
@@ -1645,24 +2031,24 @@ def iter_archive_rows(
             previous_day_last_id = str(getattr(candles[-1], "_last_trade_id"))
             previous_day_last_event = parse_timestamp(str(report.last_event_at))
         sequence = history_tail + candles
-        for previous, target in zip(sequence, sequence[1:]):
-            if previous.end == target.start:
-                continue
-            cursor = previous.end
-            while cursor < target.start:
-                gap_starts.append(cursor)
-                cursor += timedelta(seconds=duration_seconds)
-        if gap_starts:
-            raise ValueError(
-                f"Detected {len(gap_starts)} missing aligned candle windows; "
-                "quarantine and repair source coverage"
-            )
+        archive_gaps = missing_aligned_candle_windows(
+            sequence, duration_seconds=duration_seconds
+        )
+        validate_aligned_gap_window_starts(
+            [format_timestamp(gap) for gap in archive_gaps],
+            f"Archive {report.archive} gapWindowStarts",
+            duration_seconds=duration_seconds,
+            range_start=expected_day_start,
+            range_end=expected_day_start + timedelta(days=1),
+            require_complete_daily_edges=True,
+        )
+        gap_starts.extend(archive_gaps)
         owned_window_starts = {format_timestamp(candle.start) for candle in candles}
         for row in examples_from_candles(sequence, options):
             if str(row["windowStart"]) in owned_window_starts:
                 yield row
         if candles:
-            history_tail = sequence[-13:]
+            history_tail = contiguous_candle_tail(sequence)
         if archive_index % 25 == 0 or archive_index == len(archives):
             print(
                 f"Prepared {archive_index}/{len(archives)} verified daily archives...",
@@ -2773,10 +3159,20 @@ def train_draft(
         )
     )
     if target != expected_target:
-        raise ValueError("Dataset manifest target/schedule is not the governed v3 contract")
+        raise ValueError("Dataset manifest target/schedule is not the governed contract")
 
+    manifest_gap_starts = [
+        parse_timestamp(str(value)) for value in manifest["gapWindowStarts"]
+    ]
+    poisoned_window_starts = gap_poisoned_window_starts(
+        manifest_gap_starts,
+        duration_seconds=SIGNAL_DURATION_SECONDS[signal_type],
+    )
     train_rows, calibration_rows, holdout_rows, sampling = load_training_partitions(
-        input_path, signal_type, deadband_bps
+        input_path,
+        signal_type,
+        deadband_bps,
+        forbidden_window_starts=poisoned_window_starts,
     )
     corpus_audit = sampling["corpusPassAudit"]
     if not isinstance(corpus_audit, dict) or corpus_audit.get("passesMatched") is not True:
@@ -2990,9 +3386,9 @@ def train_draft(
         "trainingCodeSha256": sha256_file(Path(__file__)),
         "approval": {"approvedAt": None, "approvedBy": None},
     }
-    validate_v3_artifact(artifact)
+    validate_candidate_artifact(artifact)
     evaluation_payload = {
-        "schemaVersion": "flippars.model-evaluation/3",
+        "schemaVersion": "flippars.model-evaluation/4",
         "status": "DRAFT",
         "productionEligible": False,
         "evaluationScope": "BINANCE_CONDITIONAL_DETERMINISTIC_WINDOW_SAMPLE_DIAGNOSTIC_ONLY",
@@ -3249,7 +3645,11 @@ def outcome_support_report(
 
 
 def load_training_partitions(
-    path: Path, signal_type: str, deadband_bps: float
+    path: Path,
+    signal_type: str,
+    deadband_bps: float,
+    *,
+    forbidden_window_starts: set[str] | None = None,
 ) -> tuple[
     list[dict[str, object]],
     list[dict[str, object]],
@@ -3259,9 +3659,14 @@ def load_training_partitions(
     row_count = 0
     window_count = 0
     first_pass_audit: dict[str, object] = {}
-    for _, window_rows in iter_training_window_groups(
+    forbidden = forbidden_window_starts or set()
+    for window, window_rows in iter_training_window_groups(
         path, signal_type, deadband_bps, first_pass_audit
     ):
+        if window in forbidden:
+            raise ValueError(
+                f"Training window {window} depends on a declared source gap"
+            )
         window_count += 1
         row_count += len(window_rows)
     if window_count < 90 or row_count < 90:
@@ -3292,6 +3697,10 @@ def load_training_partitions(
     for ordinal, (window, window_rows) in enumerate(
         iter_training_window_groups(path, signal_type, deadband_bps, second_pass_audit)
     ):
+        if window in forbidden:
+            raise ValueError(
+                f"Training window {window} depends on a declared source gap"
+            )
         second_pass_window_count += 1
         partition = (
             "train"
@@ -5012,9 +5421,9 @@ def target_contract_for_options(options: DatasetOptions) -> dict[str, object]:
     return target
 
 
-def validate_v3_artifact(value: object) -> dict[str, object]:
+def validate_candidate_artifact(value: object) -> dict[str, object]:
     if not isinstance(value, dict) or value.get("schemaVersion") != ARTIFACT_SCHEMA_VERSION:
-        raise ValueError("Artifact is not a v3 draft")
+        raise ValueError("Artifact is not a supported gap-aware draft candidate")
     required = {
         "schemaVersion", "artifactId", "version", "status", "signalType", "target", "createdAt",
         "modelFitThrough", "calibrationFitThrough", "evaluationThrough", "featureSchemaVersion",
@@ -5362,7 +5771,7 @@ def validate_dataset_manifest(value: object) -> dict[str, object]:
         raise ValueError("Dataset generator metadata has an unexpected schema")
     if any(not isinstance(generator[name], str) or not generator[name] for name in generator):
         raise ValueError("Dataset generator metadata must contain nonempty strings")
-    if generator["packageVersion"] != "0.2.0":
+    if generator["packageVersion"] != "0.3.0":
         raise ValueError("Dataset generator package version is unsupported")
 
     count_names = (
@@ -5385,8 +5794,10 @@ def validate_dataset_manifest(value: object) -> dict[str, object]:
         format_timestamp(validate_canonical_timestamp(item, "gapWindowStarts"))
         for item in gap_starts
     ]
-    if canonical_gaps != sorted(set(canonical_gaps)) or canonical_gaps:
-        raise ValueError("Governed training data must contain no missing aligned windows")
+    if canonical_gaps != sorted(set(canonical_gaps)):
+        raise ValueError(
+            "Dataset manifest gaps must be canonical, strictly ordered, and unique"
+        )
     if int(value["rejectedTradeCount"]) != 0 or int(value["duplicateTradeCount"]) != 0:
         raise ValueError("Governed training data must contain no rejected or duplicate trades")
 
@@ -5568,12 +5979,50 @@ def validate_dataset_manifest(value: object) -> dict[str, object]:
             date.fromisoformat(expected_end_date), datetime.min.time(), tzinfo=UTC
         )
         schedule = target["candidateSchedule"]
-        expected_start_at = source_start + timedelta(
-            seconds=(13 * int(target["durationSeconds"]) + int(schedule["firstDecisionOffsetSeconds"]))
+        duration_seconds = int(target["durationSeconds"])
+        validated_gaps = validate_aligned_gap_window_starts(
+            gap_starts,
+            "Dataset manifest gapWindowStarts",
+            duration_seconds=duration_seconds,
+            range_start=source_start,
+            range_end=source_end,
+            require_complete_daily_edges=True,
         )
-        expected_window_count = int(
-            (source_end - source_start).total_seconds() // int(target["durationSeconds"])
-        ) - 13
+        total_window_count = int(
+            (source_end - source_start).total_seconds() // duration_seconds
+        )
+        poisoned_window_indices: set[int] = set()
+        for gap in validated_gaps:
+            gap_index = int((gap - source_start).total_seconds()) // duration_seconds
+            first_poisoned = max(13, gap_index)
+            last_poisoned = min(total_window_count - 1, gap_index + 13)
+            poisoned_window_indices.update(
+                range(first_poisoned, last_poisoned + 1)
+            )
+        expected_window_count = total_window_count - 13 - len(
+            poisoned_window_indices
+        )
+        if expected_window_count < 1:
+            raise ValueError("Dataset gaps leave no eligible prepared windows")
+        first_eligible_window = next(
+            index
+            for index in range(13, total_window_count)
+            if index not in poisoned_window_indices
+        )
+        last_eligible_window = next(
+            index
+            for index in range(total_window_count - 1, 12, -1)
+            if index not in poisoned_window_indices
+        )
+        expected_start_at = source_start + timedelta(
+            seconds=(
+                first_eligible_window * duration_seconds
+                + int(schedule["firstDecisionOffsetSeconds"])
+            )
+        )
+        expected_end_at = source_start + timedelta(
+            seconds=(last_eligible_window + 1) * duration_seconds
+        )
         rows_per_window = (
             (
                 int(schedule["lastDecisionOffsetSeconds"])
@@ -5584,11 +6033,15 @@ def validate_dataset_manifest(value: object) -> dict[str, object]:
         )
         if (
             start_at != expected_start_at
-            or end_at != source_end
+            or end_at != expected_end_at
             or window_count != expected_window_count
             or int(value["preparedDecisionRowCount"]) != expected_window_count * rows_per_window
         ):
-            raise ValueError("Prepared coverage does not match the complete source range and schedule")
+            raise ValueError(
+                "Prepared coverage does not match the gap-abstaining source schedule"
+            )
+    elif canonical_gaps:
+        raise ValueError("Archive-free dataset manifest cannot contain gap lineage")
     if lineage_kind == "PUBLIC_BINANCE_ARCHIVE":
         validate_embedded_acquisition_evidence(
             source["acquisitionEvidence"], archives, source["startDateInclusive"], source["endDateExclusive"]
@@ -6108,7 +6561,7 @@ def runtime_metadata() -> dict[str, object]:
         "pythonVersion": platform.python_version(),
         "implementation": platform.python_implementation(),
         "platform": platform.platform(),
-        "packageVersion": "0.2.0",
+        "packageVersion": "0.3.0",
     }
 
 

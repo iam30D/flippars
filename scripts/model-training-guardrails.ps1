@@ -167,6 +167,145 @@ function Invoke-LoggedNativeProcess {
   }
 }
 
+function Invoke-CapturedNativeProcess {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$FilePath,
+    [Parameter(Mandatory)]
+    [AllowEmptyCollection()]
+    [AllowEmptyString()]
+    [string[]]$ArgumentList,
+    [ValidateNotNullOrEmpty()][string]$WorkingDirectory = (Get-Location).Path,
+    [ValidateRange(1, 1048576)][int]$MaxCombinedBytes = 1MB
+  )
+
+  $workingPath = [System.IO.Path]::GetFullPath($WorkingDirectory)
+  if (-not [System.IO.Directory]::Exists($workingPath)) {
+    throw "Native process working directory does not exist: $workingPath"
+  }
+  $encodedArguments = @(
+    foreach ($argument in $ArgumentList) {
+      ConvertTo-WindowsNativeArgument -Value $argument
+    }
+  )
+  $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+  $startInfo.FileName = $FilePath
+  $startInfo.Arguments = [string]::Join(' ', [string[]]$encodedArguments)
+  $startInfo.WorkingDirectory = $workingPath
+  $startInfo.UseShellExecute = $false
+  $startInfo.CreateNoWindow = $true
+  $startInfo.RedirectStandardOutput = $true
+  $startInfo.RedirectStandardError = $true
+  $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+  $startInfo.StandardOutputEncoding = $strictUtf8
+  $startInfo.StandardErrorEncoding = $strictUtf8
+
+  $process = [System.Diagnostics.Process]::new()
+  $process.StartInfo = $startInfo
+  $processStarted = $false
+  $stdoutStream = $null
+  $stderrStream = $null
+  $stdoutCapture = $null
+  $stderrCapture = $null
+  $stdoutTask = $null
+  $stderrTask = $null
+  try {
+    if (-not $process.Start()) {
+      throw "Unable to start native process: $FilePath"
+    }
+    $processStarted = $true
+    $capturedBytes = [long]0
+    $stdoutStream = $process.StandardOutput.BaseStream
+    $stderrStream = $process.StandardError.BaseStream
+    $stdoutCapture = [System.IO.MemoryStream]::new()
+    $stderrCapture = [System.IO.MemoryStream]::new()
+    $stdoutBuffer = [byte[]]::new(8192)
+    $stderrBuffer = [byte[]]::new(8192)
+    $stdoutOpen = $true
+    $stderrOpen = $true
+    $stdoutTask = $stdoutStream.ReadAsync(
+      $stdoutBuffer,
+      0,
+      $stdoutBuffer.Length
+    )
+    $stderrTask = $stderrStream.ReadAsync(
+      $stderrBuffer,
+      0,
+      $stderrBuffer.Length
+    )
+
+    while ($stdoutOpen -or $stderrOpen) {
+      $pendingTasks = [System.Collections.Generic.List[System.Threading.Tasks.Task]]::new()
+      if ($stdoutOpen) { [void]$pendingTasks.Add($stdoutTask) }
+      if ($stderrOpen) { [void]$pendingTasks.Add($stderrTask) }
+      [void][System.Threading.Tasks.Task]::WaitAny($pendingTasks.ToArray(), 250)
+
+      if ($stdoutOpen -and $stdoutTask.IsCompleted) {
+        $count = $stdoutTask.GetAwaiter().GetResult()
+        if ($count -eq 0) {
+          $stdoutOpen = $false
+        } else {
+          if (($capturedBytes + [long]$count) -gt $MaxCombinedBytes) {
+            throw "Captured native process exceeded the combined output limit of $MaxCombinedBytes bytes."
+          }
+          $stdoutCapture.Write($stdoutBuffer, 0, $count)
+          $capturedBytes += [long]$count
+          $stdoutTask = $stdoutStream.ReadAsync(
+            $stdoutBuffer,
+            0,
+            $stdoutBuffer.Length
+          )
+        }
+      }
+      if ($stderrOpen -and $stderrTask.IsCompleted) {
+        $count = $stderrTask.GetAwaiter().GetResult()
+        if ($count -eq 0) {
+          $stderrOpen = $false
+        } else {
+          if (($capturedBytes + [long]$count) -gt $MaxCombinedBytes) {
+            throw "Captured native process exceeded the combined output limit of $MaxCombinedBytes bytes."
+          }
+          $stderrCapture.Write($stderrBuffer, 0, $count)
+          $capturedBytes += [long]$count
+          $stderrTask = $stderrStream.ReadAsync(
+            $stderrBuffer,
+            0,
+            $stderrBuffer.Length
+          )
+        }
+      }
+    }
+
+    $process.WaitForExit()
+    return [pscustomobject][ordered]@{
+      ExitCode = [int]$process.ExitCode
+      Stdout = $strictUtf8.GetString($stdoutCapture.ToArray())
+      Stderr = $strictUtf8.GetString($stderrCapture.ToArray())
+    }
+  } finally {
+    $shouldStop = $false
+    if ($processStarted) {
+      try { $shouldStop = -not $process.HasExited } catch { }
+    }
+    if ($shouldStop) {
+      try { $process.Kill() } catch { }
+    }
+    if ($null -ne $stdoutStream) { try { $stdoutStream.Dispose() } catch { } }
+    if ($null -ne $stderrStream) { try { $stderrStream.Dispose() } catch { } }
+    if ($processStarted) {
+      try { [void]$process.WaitForExit(5000) } catch { }
+    }
+    foreach ($readTask in @($stdoutTask, $stderrTask)) {
+      if ($null -ne $readTask) {
+        try { [void]$readTask.Wait(1000) } catch { }
+      }
+    }
+    if ($null -ne $stdoutCapture) { try { $stdoutCapture.Dispose() } catch { } }
+    if ($null -ne $stderrCapture) { try { $stderrCapture.Dispose() } catch { } }
+    try { $process.Dispose() } catch { }
+  }
+}
+
 function ConvertTo-NormalizedFullPath {
   [CmdletBinding()]
   param([Parameter(Mandatory)][string]$Path)
@@ -396,6 +535,213 @@ function Get-Sha256Record {
     }
   }
   throw "Cannot hash a directory as a file: $Path"
+}
+
+function Assert-CompletedModelTrainingRun {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][string]$RunManifestPath,
+    [Parameter(Mandatory)][string]$PreparedPath,
+    [Parameter(Mandatory)][string]$DatasetManifestPath,
+    [Parameter(Mandatory)][string]$CandidatePath,
+    [Parameter(Mandatory)][string]$EvaluationPath,
+    [Parameter(Mandatory)][string]$CommandLogPath,
+    [Parameter(Mandatory)][string]$CrossRuntimeLogPath,
+    [Parameter(Mandatory)][string]$ExpectedVersion,
+    [Parameter(Mandatory)]
+    [ValidateSet(
+      'FIVE_MINUTE_REVERSAL',
+      'FIFTEEN_MINUTE_REVERSAL',
+      'FIVE_MINUTE_EARLY_DIRECTION'
+    )]
+    [string]$ExpectedSignalType
+  )
+
+  Assert-NoReparsePointAncestor $RunManifestPath
+  if (-not (Test-Path -LiteralPath $RunManifestPath -PathType Leaf)) {
+    throw "Completed-run evidence is missing: $RunManifestPath"
+  }
+  $runManifestItem = Get-Item -LiteralPath $RunManifestPath -Force
+  if (($runManifestItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+      [long]$runManifestItem.Length -le 0) {
+    throw "Completed-run evidence must be a nonempty regular file: $RunManifestPath"
+  }
+  try {
+    $runManifest = Get-Content -LiteralPath $RunManifestPath -Raw |
+      ConvertFrom-Json -ErrorAction Stop
+  } catch {
+    throw "Completed-run evidence is not valid JSON: $RunManifestPath"
+  }
+  $runManifestSchemaIsInteger = (
+    ($runManifest.schemaVersion -is [int]) -or
+    ($runManifest.schemaVersion -is [long])
+  )
+  if ((-not $runManifestSchemaIsInteger) -or
+      ([long]$runManifest.schemaVersion -ne 2) -or
+      ($runManifest.completionState -cne 'COMPLETE') -or
+      ($runManifest.target.venue -cne 'BINANCE') -or
+      ($runManifest.target.marketType -cne 'SPOT') -or
+      ($runManifest.target.symbol -cne 'BTCUSDT') -or
+      ($runManifest.target.signalType -cne $ExpectedSignalType) -or
+      ($runManifest.lifecycle.artifactStatus -cne 'DRAFT') -or
+      (-not ($runManifest.lifecycle.signalsEnabled -is [bool])) -or
+      ($runManifest.lifecycle.signalsEnabled -ne $false) -or
+      (-not ($runManifest.lifecycle.promotionAttempted -is [bool])) -or
+      ($runManifest.lifecycle.promotionAttempted -ne $false)) {
+    throw 'Completed-run evidence has an invalid target, lifecycle, or completion identity.'
+  }
+
+  $expectedOutputPaths = @(
+    $PreparedPath,
+    $DatasetManifestPath,
+    $CandidatePath,
+    $EvaluationPath,
+    $CommandLogPath,
+    $CrossRuntimeLogPath
+  )
+  $expectedByPath = [System.Collections.Generic.Dictionary[string, string]]::new(
+    [System.StringComparer]::OrdinalIgnoreCase
+  )
+  foreach ($expectedPath in $expectedOutputPaths) {
+    $normalizedExpectedPath = ConvertTo-NormalizedFullPath $expectedPath
+    if ($expectedByPath.ContainsKey($normalizedExpectedPath)) {
+      throw "Completed-run output contract contains a duplicate path: $normalizedExpectedPath"
+    }
+    $expectedByPath.Add($normalizedExpectedPath, $normalizedExpectedPath)
+  }
+
+  $outputRecords = @($runManifest.outputs)
+  if ($outputRecords.Count -ne $expectedByPath.Count) {
+    throw 'Completed-run evidence must record exactly the six governed outputs.'
+  }
+  $seenPaths = [System.Collections.Generic.HashSet[string]]::new(
+    [System.StringComparer]::OrdinalIgnoreCase
+  )
+  $actualHashes = [System.Collections.Generic.Dictionary[string, string]]::new(
+    [System.StringComparer]::OrdinalIgnoreCase
+  )
+  $outputIndex = 0
+  foreach ($outputRecord in $outputRecords) {
+    $outputIndex += 1
+    if ($null -eq $outputRecord -or
+        [string]::IsNullOrWhiteSpace([string]$outputRecord.Path)) {
+      throw 'Completed-run evidence contains an output without a path.'
+    }
+    $recordedPathText = [string]$outputRecord.Path
+    if (-not [System.IO.Path]::IsPathRooted($recordedPathText)) {
+      throw 'Completed-run evidence contains a relative output path.'
+    }
+    try {
+      $recordedPath = ConvertTo-NormalizedFullPath $recordedPathText
+    } catch {
+      throw 'Completed-run evidence contains an invalid output path.'
+    }
+    if (-not $recordedPathText.Equals(
+      $recordedPath,
+      [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+      throw "Completed-run evidence contains a noncanonical output path: $recordedPathText"
+    }
+    if (-not $expectedByPath.ContainsKey($recordedPath)) {
+      throw "Completed-run evidence records an unexpected output: $recordedPath"
+    }
+    if (-not $seenPaths.Add($recordedPath)) {
+      throw "Completed-run evidence records a duplicate output: $recordedPath"
+    }
+    $expectedPath = $expectedByPath[$recordedPath]
+    Assert-NoReparsePointAncestor $expectedPath
+    if (-not (Test-Path -LiteralPath $expectedPath -PathType Leaf)) {
+      throw "Completed-run output is missing: $expectedPath"
+    }
+    $outputItem = Get-Item -LiteralPath $expectedPath -Force
+    if ($outputItem.PSIsContainer -or
+        (($outputItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) -or
+        ([long]$outputItem.Length -le 0)) {
+      throw "Completed-run output must be a nonempty regular file: $expectedPath"
+    }
+    if ([string]$outputRecord.Sha256 -cnotmatch '^[a-f0-9]{64}$') {
+      throw "Completed-run output has an invalid recorded digest: $expectedPath"
+    }
+    $recordedBytesIsInteger = (
+      ($outputRecord.Bytes -is [int]) -or
+      ($outputRecord.Bytes -is [long])
+    )
+    if ((-not $recordedBytesIsInteger) -or
+        ([long]$outputRecord.Bytes -lt 1)) {
+      throw "Completed-run output has an invalid recorded byte count: $expectedPath"
+    }
+    Write-Host (
+      '  Verifying completed output {0}/{1}: {2}' -f `
+        $outputIndex,
+        $expectedByPath.Count,
+        [System.IO.Path]::GetFileName($expectedPath)
+    ) -ForegroundColor DarkGray
+    $actualRecord = Get-Sha256Record $expectedPath
+    if ((ConvertTo-NormalizedFullPath ([string]$actualRecord.Path)) -cne $expectedPath -or
+        ([long]$outputRecord.Bytes -ne [long]$actualRecord.Bytes) -or
+        ([string]$outputRecord.Sha256 -cne [string]$actualRecord.Sha256)) {
+      throw "Completed-run output does not match its recorded path, size, or digest: $expectedPath"
+    }
+    $actualHashes.Add($expectedPath, [string]$actualRecord.Sha256)
+  }
+  if ($seenPaths.Count -ne $expectedByPath.Count) {
+    throw 'Completed-run evidence does not cover every governed output exactly once.'
+  }
+
+  try {
+    $candidate = Get-Content -LiteralPath $CandidatePath -Raw |
+      ConvertFrom-Json -ErrorAction Stop
+    $evaluation = Get-Content -LiteralPath $EvaluationPath -Raw |
+      ConvertFrom-Json -ErrorAction Stop
+    $datasetManifest = Get-Content -LiteralPath $DatasetManifestPath -Raw |
+      ConvertFrom-Json -ErrorAction Stop
+  } catch {
+    throw 'Completed-run candidate, evaluation, or dataset manifest is not valid JSON.'
+  }
+  if (($candidate.schemaVersion -cne 'flippars.multinomial-candidate/4') -or
+      ($candidate.version -cne $ExpectedVersion) -or
+      ($candidate.signalType -cne $ExpectedSignalType) -or
+      ($candidate.status -cne 'DRAFT') -or
+      ($candidate.target.venue -cne 'BINANCE') -or
+      ($candidate.target.marketType -cne 'SPOT') -or
+      ($candidate.target.symbol -cne 'BTCUSDT') -or
+      ($null -ne $candidate.approval.approvedAt) -or
+      ($null -ne $candidate.approval.approvedBy)) {
+    throw 'Completed-run candidate has an invalid identity, target, or lifecycle.'
+  }
+  if (($evaluation.schemaVersion -cne 'flippars.model-evaluation/4') -or
+      ($evaluation.artifactSchemaVersion -cne $candidate.schemaVersion) -or
+      ($evaluation.version -cne $ExpectedVersion) -or
+      ($evaluation.signalType -cne $ExpectedSignalType) -or
+      ($evaluation.status -cne 'DRAFT') -or
+      (-not ($evaluation.productionEligible -is [bool])) -or
+      ($evaluation.productionEligible -ne $false) -or
+      ($evaluation.evaluationScope -cne
+       'BINANCE_CONDITIONAL_DETERMINISTIC_WINDOW_SAMPLE_DIAGNOSTIC_ONLY')) {
+    throw 'Completed-run evaluation has an invalid identity, scope, or lifecycle.'
+  }
+  if (($datasetManifest.schemaVersion -cne 'flippars.dataset-manifest/3') -or
+      ($datasetManifest.symbol -cne 'BTCUSDT') -or
+      ($datasetManifest.target.signalType -cne $ExpectedSignalType)) {
+    throw 'Completed-run dataset manifest has an invalid schema or target identity.'
+  }
+
+  $normalizedPreparedPath = ConvertTo-NormalizedFullPath $PreparedPath
+  $normalizedDatasetManifestPath = ConvertTo-NormalizedFullPath $DatasetManifestPath
+  $preparedSha256 = $actualHashes[$normalizedPreparedPath]
+  $datasetManifestSha256 = $actualHashes[$normalizedDatasetManifestPath]
+  if (($candidate.datasetContentSha256 -cne $preparedSha256) -or
+      ($candidate.datasetManifestSha256 -cne $datasetManifestSha256) -or
+      ($candidate.datasetManifest.datasetContentSha256 -cne $preparedSha256) -or
+      ($candidate.datasetManifest.datasetManifestSha256 -cne $datasetManifestSha256) -or
+      ($evaluation.datasetSha256 -cne $preparedSha256) -or
+      ($evaluation.datasetManifestSha256 -cne $datasetManifestSha256) -or
+      ([string]$candidate.preEvaluationPolicySha256 -cnotmatch '^[a-f0-9]{64}$') -or
+      ($candidate.preEvaluationPolicySha256 -cne $evaluation.preEvaluationPolicySha256)) {
+    throw 'Completed-run candidate and evaluation do not bind the exact recorded dataset.'
+  }
+
+  return $runManifest
 }
 
 function Get-Utf8TextSha256 {

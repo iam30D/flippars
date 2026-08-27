@@ -38,7 +38,9 @@ three-class probability mass, separate dataset-content/lineage digests, unique
 window counts, and unavailable cross-venue history. Unknown fields or silent
 two-class/deadband/timeframe substitutions fail validation.
 
-The strict `flippars.dataset-manifest-summary/3` contract also distinguishes
-freshly attested `PUBLIC_BINANCE_ARCHIVE`, unattested `LOCAL_ARCHIVE_REPLAY`,
-and `SYNTHETIC_LOCAL` lineage. Public lineage requires both acquisition
-digests and complete official HTTPS checksum-transport evidence.
+The immutable `flippars.dataset-manifest-summary/3` contract remains gap-free.
+The additive `/4` contract permits nonzero gap counts for source-verified
+no-trade intervals whose dependent windows were omitted. Both distinguish freshly
+attested `PUBLIC_BINANCE_ARCHIVE`, unattested `LOCAL_ARCHIVE_REPLAY`, and
+`SYNTHETIC_LOCAL` lineage. Public lineage requires both acquisition digests and
+complete official HTTPS checksum-transport evidence.

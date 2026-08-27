@@ -52,9 +52,10 @@ provider/outcome evaluator must use the public trade stream for parity;
 - Dataset manifests identify source/archive indexes and checksums, time range,
   accepted/rejected/duplicate/gap counts, filters, code, target/deadband/feature
   versions, the candidate schedule, and independent window versus row counts.
-- The strict training lineage contract uses
-  `flippars.dataset-manifest/2` and derives
-  `flippars.dataset-manifest-summary/3`. `PUBLIC_BINANCE_ARCHIVE` requires a
+- Gap-free historical candidates retain the immutable
+  `flippars.dataset-manifest/2` and `flippars.dataset-manifest-summary/3`
+  readers. New gap-abstaining candidates use `flippars.dataset-manifest/3` and
+  derive `flippars.dataset-manifest-summary/4`. `PUBLIC_BINANCE_ARCHIVE` requires a
   complete schema-3 acquisition binding with freshly retrieved Binance HTTPS
   checksum transport for every selected day. Unattested archive input is
   `LOCAL_ARCHIVE_REPLAY`, including normalized replay; only generated fixture
@@ -75,6 +76,34 @@ provider/outcome evaluator must use the public trade stream for parity;
 - Every accepted training window contains the exact ordered governed decision
   schedule. Missing first, middle, or final decision rows fail closed rather
   than entering a sample described as complete.
+
+### Internal no-trade intervals
+
+An internal aligned interval with no trades is not automatically a damaged
+archive. It may be classified as a verified venue no-trade interval only when
+all of the following evidence agrees:
+
+- The selected daily archive matches a freshly retrieved official HTTPS
+  checksum and retains its acquisition binding.
+- The trades immediately before and after the internal interval have
+  consecutive trade IDs and ordered event times.
+- The rest of the daily archive has valid day-edge coverage, schema, ordering,
+  and numeric values.
+
+That classification describes the observed data; it does not infer why the
+venue had no trades. Retain every affected aligned window start in dataset
+lineage, synthesize no trade, price, candle, volume, or label, and never
+forward-fill across the interval. The gap windows do not become training
+examples. Candidate examples whose required 13 completed lookback windows
+intersect a retained gap are also omitted, so accepted examples always retain
+contiguous causal history and the complete governed decision schedule.
+
+Missing trade IDs, a checksum mismatch, corrupt content, an incomplete day
+edge, or a gap that cannot satisfy the evidence above remains a source-coverage
+incident. Quarantine the exact affected source material with retained evidence,
+reacquire it from the approved source, and fail closed if complete coverage
+cannot be established. Do not relabel a source defect as a venue no-trade
+interval and do not repair either class speculatively.
 
 ## Classification
 

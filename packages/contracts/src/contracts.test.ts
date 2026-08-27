@@ -10,6 +10,8 @@ import {
   BinanceSpotForecastTargetSchema,
   CloseRelationProbabilitiesSchema,
   DatasetManifestSummarySchema,
+  DatasetManifestSummaryV3Schema,
+  DatasetManifestSummaryV4Schema,
   GuestCredentialSchema,
   MarketSnapshotSchema,
   PRE_EVALUATION_POLICY_CANONICALIZATION,
@@ -644,6 +646,27 @@ describe("Binance research contracts", () => {
     if (!parsed.success) {
       assert.fail("Expected valid public dataset summary fixture");
     }
+    const gappedV3 = { ...parsed.data, gapCount: 30 };
+    const gappedV4 = {
+      ...parsed.data,
+      schemaVersion: "flippars.dataset-manifest-summary/4",
+      gapCount: 30,
+    };
+    assert.equal(DatasetManifestSummarySchema.safeParse(gappedV3).success, false);
+    assert.equal(DatasetManifestSummaryV3Schema.safeParse(gappedV3).success, false);
+    assert.equal(DatasetManifestSummaryV4Schema.safeParse(gappedV4).success, true);
+    assert.equal(
+      DatasetManifestSummaryV3Schema.safeParse({
+        ...gappedV3,
+        lineageKind: "LOCAL_ARCHIVE_REPLAY",
+        source: "LOCAL_ARCHIVE_REPLAY",
+        archiveChecksumsVerified: false,
+        officialTransportEvidenceVerified: false,
+        acquisitionArchiveIndexSha256: null,
+        acquisitionManifestSha256: null,
+      }).success,
+      false,
+    );
     for (const mutation of [
       {
         archiveCount: 0,
@@ -652,8 +675,8 @@ describe("Binance research contracts", () => {
         sourceEndDateExclusive: null,
       },
       { acceptedTradeCount: 0 },
+      { gapCount: Number.MAX_SAFE_INTEGER + 1 },
       { rejectedTradeCount: 1 },
-      { gapCount: 1 },
       { duplicateTradeCount: 1 },
     ]) {
       assert.equal(

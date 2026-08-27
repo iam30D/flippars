@@ -31,6 +31,9 @@ readable only for existing dry-run evidence; it is not treated as V3-equivalent.
 Promotion verification additionally requires schema-3 public-source summary
 evidence, fresh official checksum transport, and both acquisition manifest and
 archive-index digests; local replay and synthetic lineage remain offline-only.
+The V4 candidate preserves those target and feature rules while binding the
+gap-aware dataset-summary V4 contract. V3 remains an immutable historical
+reader; V4 has no promotion-bundle schema and therefore remains DRAFT-only.
 
 ## Bundle layout
 

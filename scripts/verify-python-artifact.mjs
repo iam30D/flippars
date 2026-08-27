@@ -8,8 +8,9 @@ import {
   canonicalPreEvaluationPolicyJson,
   parseCanonicalJsonObjectPreimage,
 } from "../packages/contracts/dist/index.js";
-import { DraftBinanceMultinomialArtifactSchema } from "../packages/model-artifact/dist/schema.js";
+import { DraftBinanceMultinomialArtifactV4Schema } from "../packages/model-artifact/dist/schema.js";
 import { parseJsonDocument } from "../packages/model-artifact/dist/verifier.js";
+import { auditPreparedModelDataset } from "./audit-prepared-model-dataset.mjs";
 
 const requiredArguments = new Set([
   "--artifact",
@@ -138,9 +139,94 @@ const archiveReportKeys = [
   "missing_trade_id_ranges",
 ];
 
+const canonicalMillisecondUtcTimestampPattern =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
+
+function validateGapLineage(manifest) {
+  assert.ok(
+    Number.isSafeInteger(manifest.gapCount) && manifest.gapCount >= 0,
+    "dataset manifest gapCount must be a nonnegative safe integer",
+  );
+  assert.ok(
+    Array.isArray(manifest.gapWindowStarts),
+    "dataset manifest gapWindowStarts must be an array",
+  );
+  assert.equal(
+    manifest.gapWindowStarts.length,
+    manifest.gapCount,
+    "dataset manifest gapWindowStarts length must equal gapCount",
+  );
+
+  const durationSeconds = manifest.target?.durationSeconds;
+  assert.ok(
+    Number.isSafeInteger(durationSeconds) && durationSeconds > 0,
+    "dataset manifest target durationSeconds must be a positive safe integer",
+  );
+  const durationMillis = durationSeconds * 1_000;
+  const dayMillis = 86_400_000;
+  assert.equal(
+    dayMillis % durationMillis,
+    0,
+    "dataset manifest target durationSeconds must divide one UTC day",
+  );
+  const sourceStartMillis = Date.parse(
+    `${manifest.source?.startDateInclusive}T00:00:00.000Z`,
+  );
+  const sourceEndMillis = Date.parse(
+    `${manifest.source?.endDateExclusive}T00:00:00.000Z`,
+  );
+  if (manifest.gapWindowStarts.length > 0) {
+    assert.ok(
+      Number.isFinite(sourceStartMillis) &&
+        Number.isFinite(sourceEndMillis) &&
+        sourceStartMillis < sourceEndMillis,
+      "dataset manifest gap source date range must be valid",
+    );
+  }
+
+  let previousGapMillis = Number.NEGATIVE_INFINITY;
+  for (const [index, gapStart] of manifest.gapWindowStarts.entries()) {
+    assert.equal(
+      typeof gapStart,
+      "string",
+      `dataset gap ${index} must be a timestamp string`,
+    );
+    assert.match(
+      gapStart,
+      canonicalMillisecondUtcTimestampPattern,
+      `dataset gap ${index} must be a canonical millisecond-Z timestamp`,
+    );
+    const gapMillis = Date.parse(gapStart);
+    assert.equal(
+      new Date(gapMillis).toISOString(),
+      gapStart,
+      `dataset gap ${index} must round-trip as a canonical timestamp`,
+    );
+    assert.ok(
+      gapMillis > previousGapMillis,
+      "dataset manifest gapWindowStarts must be strictly sorted and unique",
+    );
+    assert.equal(
+      gapMillis % durationMillis,
+      0,
+      `dataset gap ${index} must align to target durationSeconds`,
+    );
+    assert.ok(
+      gapMillis >= sourceStartMillis && gapMillis < sourceEndMillis,
+      `dataset gap ${index} must fall within the source date range`,
+    );
+    const offsetWithinDay = gapMillis % dayMillis;
+    assert.ok(
+      offsetWithinDay !== 0 && offsetWithinDay + durationMillis !== dayMillis,
+      `dataset gap ${index} must not hide an incomplete UTC day edge`,
+    );
+    previousGapMillis = gapMillis;
+  }
+}
+
 function deriveDatasetManifestSummary(manifest, contentSha256, manifestSha256) {
   assertExactKeys(manifest, datasetManifestKeys, "dataset manifest");
-  assert.equal(manifest.schemaVersion, "flippars.dataset-manifest/2");
+  assert.equal(manifest.schemaVersion, "flippars.dataset-manifest/3");
   assert.equal(manifest.datasetSchemaVersion, "flippars.training-dataset/3");
   assert.equal(manifest.symbol, "BTCUSDT");
   assert.deepEqual(manifest.target, artifact.target);
@@ -151,6 +237,7 @@ function deriveDatasetManifestSummary(manifest, contentSha256, manifestSha256) {
     sourceIntegrityRequired: true,
   });
   assertExactKeys(manifest.source, datasetSourceKeys, "dataset source");
+  validateGapLineage(manifest);
   assert.ok(
     Array.isArray(manifest.source.archives),
     "dataset archives must be an array",
@@ -265,7 +352,7 @@ function deriveDatasetManifestSummary(manifest, contentSha256, manifestSha256) {
     );
   }
   return {
-    schemaVersion: "flippars.dataset-manifest-summary/3",
+    schemaVersion: "flippars.dataset-manifest-summary/4",
     datasetContentSha256: contentSha256,
     datasetManifestSha256: manifestSha256,
     symbol: "BTCUSDT",
@@ -336,7 +423,7 @@ const manifestDocument = readJson(
   "dataset manifest",
 );
 const evaluationDocument = readJson(argumentsByName.get("--evaluation"), "evaluation");
-const artifact = DraftBinanceMultinomialArtifactSchema.parse(artifactDocument.value);
+const artifact = DraftBinanceMultinomialArtifactV4Schema.parse(artifactDocument.value);
 const datasetManifest = manifestDocument.value;
 const evaluation = evaluationDocument.value;
 const preEvaluationPolicy = PreEvaluationPolicySchema.parse(
@@ -356,8 +443,12 @@ const samplingPreimage = parsePolicyPreimage(
   "sampling",
 );
 
+const preparedAudit = await auditPreparedModelDataset(
+  argumentsByName.get("--prepared"),
+  datasetManifest,
+);
 assert.equal(
-  await sha256File(argumentsByName.get("--prepared")),
+  preparedAudit.sha256,
   artifact.datasetContentSha256,
   "prepared dataset digest does not match the Python artifact",
 );
@@ -438,19 +529,23 @@ assert.equal(evaluation.datasetManifestSha256, artifact.datasetManifestSha256);
 assert.equal(evaluation.preEvaluationPolicySha256, artifact.preEvaluationPolicySha256);
 assert.equal(evaluation.sampling.corpusPassAudit.passesMatched, true);
 assert.equal(evaluation.sampling.corpusPassAudit.sha256, artifact.datasetContentSha256);
+assert.equal(evaluation.sampling.corpusPassAudit.byteCount, preparedAudit.byteCount);
 assert.equal(
   evaluation.sampling.corpusPassAudit.decisionRowCount,
-  datasetManifest.preparedDecisionRowCount,
+  preparedAudit.decisionRowCount,
 );
 assert.equal(
   evaluation.sampling.corpusPassAudit.windowCount,
-  datasetManifest.preparedWindowCount,
+  preparedAudit.windowCount,
 );
 assert.equal(
   evaluation.sampling.corpusPassAudit.firstDecisionAt,
-  datasetManifest.startAt,
+  preparedAudit.firstDecisionAt,
 );
-assert.equal(evaluation.sampling.corpusPassAudit.lastWindowEnd, datasetManifest.endAt);
+assert.equal(
+  evaluation.sampling.corpusPassAudit.lastWindowEnd,
+  preparedAudit.lastWindowEnd,
+);
 assert.equal(
   sha256(Buffer.from(canonicalPreEvaluationPolicyJson(preEvaluationPolicy), "utf8")),
   artifact.preEvaluationPolicySha256,
@@ -516,7 +611,7 @@ const samplingProjection = Object.fromEntries(
   }),
 );
 assert.deepEqual(samplingPreimage, samplingProjection);
-assert.equal(evaluation.schemaVersion, "flippars.model-evaluation/3");
+assert.equal(evaluation.schemaVersion, "flippars.model-evaluation/4");
 assert.equal(
   evaluation.evaluationScope,
   "BINANCE_CONDITIONAL_DETERMINISTIC_WINDOW_SAMPLE_DIAGNOSTIC_ONLY",
@@ -537,6 +632,7 @@ process.stdout.write(
   `${JSON.stringify({
     schema: true,
     digests: true,
+    preparedDatasetAudit: true,
     preEvaluationPolicy: true,
     acquisitionEvidence:
       artifact.datasetManifest.lineageKind === "PUBLIC_BINANCE_ARCHIVE",

@@ -14,7 +14,8 @@ healthy venues; an explicitly degraded two-venue quorum may display a price but
 cannot emit a signal unless the approved policy says otherwise. A stablecoin
 deviation or missing conversion removes Binance from the reference calculation.
 
-The additive `flippars.multinomial-candidate/3` research contract instead binds
+The additive historical `flippars.multinomial-candidate/3` and gap-aware
+`flippars.multinomial-candidate/4` research contracts instead bind
 forecast features and outcome truth to Binance Spot `BTCUSDT` public trades.
 Coinbase, Kraken, and USDT/USD remain independent health, anomaly, and display
 guards; they are not blended into this target. This contract does not relabel

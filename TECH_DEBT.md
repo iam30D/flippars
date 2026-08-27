@@ -31,6 +31,14 @@ Nothing in this file authorizes bypassing a release gate.
 
 ## Deferred enhancements
 
+- Replace the operator-pasted multi-signal training/recovery wrapper with a
+  reviewed, tracked launcher that pins one immutable plan, resumes only an
+  explicitly selected semantically identical version, fails closed when more
+  than one compatible root exists, and allocates a new version without copying
+  checkpoints when source, code, or policy changes.
+- Add an immutable dataset revision identifier beyond symbol/date range so a
+  reviewed reacquisition can preserve the original snapshot and evidence
+  instead of mutating or colliding with it.
 - StoreKit subscriptions and Sign in with Apple account migration.
 - Licensed geopolitical/news evidence retrieval and guarded summarization.
 - Options, on-chain, and derivatives feature packs beyond core adapters.

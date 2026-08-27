@@ -6,6 +6,7 @@
 | Fifteen-minute final-half reversal | UTC eligibility tests at 7:30 boundary                        | Target-specific shadow report          |
 | Five-minute first-minute direction | 0–60 second eligibility tests                                 | Target-specific shadow report          |
 | Only qualified signals             | Approval, calibration, health, anomaly, and dedupe gates      | Calibration/coverage report            |
+| Offline no-trade intervals         | Exact gap lineage, no synthesis, and 13-window exclusions     | Deterministic incident/recovery replay |
 | Pump/dump protection               | Anomaly risk and suppression policy                           | Held-out/red-team incident set         |
 | Reasons for movement               | Evidence layers and cautious language                         | Content/legal comprehension review     |
 | Low-latency notification handoff   | Expiring APNs handoff and foreground stream                   | Physical-device latency report         |

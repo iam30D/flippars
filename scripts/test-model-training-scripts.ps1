@@ -236,13 +236,29 @@ Assert-True ($runnerText.Contains('[switch]$Resume')) `
 Assert-True ($runnerText.Contains("Kind = 'ArchivePreparation'")) `
   'The runner must distinguish a resumable archive-checkpoint state.'
 Assert-True ($runnerText.Contains("Kind = 'PreparedDataset'")) `
-  'The runner must distinguish a reusable prepared-dataset state.'
+  'The runner must classify a standalone prepared pair before selecting replacement.'
 Assert-True ($runnerText.Contains("'.prepared.jsonl.archive-checkpoints'")) `
   'The runner must bind Python automatic checkpoints to the exact hidden store.'
 Assert-True ($runnerText.Contains('-Append:$runStartState.AppendFirstChild')) `
   'The first resumed child must append to the existing command log.'
 Assert-True ($runnerText.Contains('Write-ModelTrainingResumeSessionMarker')) `
   'Every resumed execution must write a durable visible session boundary.'
+Assert-True ($runnerText.Contains('Assert-ArchiveResumeSemanticCompatibility')) `
+  'Resume must prove semantic plan and checkpoint compatibility before Python execution.'
+Assert-True ($runnerText.Contains('PYTHON_VALIDATION_REQUIRED') -and
+    $runnerText.Contains('preflight-archive-resume') -and
+    $runnerText.Contains('Invoke-CapturedNativeProcess')) `
+  'Plan compatibility must be followed by the read-only full Python admission check.'
+Assert-True ($runnerText.Contains('Resume has no durable daily checkpoint to preserve.')) `
+  'A plan-only interruption must select an immutable replacement.'
+Assert-True ($runnerText.Contains('flippars.archive-preparation-checkpoint/2')) `
+  'Resume must reject checkpoints from an older gap policy.'
+Assert-True ($runnerText.Contains(
+    'For an interruption or transient failure with unchanged source, code, and policy,'
+  )) 'Preparation failure guidance must limit same-version resume to unchanged inputs.'
+Assert-True ($runnerText.Contains(
+    'preserve this run and use a new model version without -Resume.'
+  )) 'Preparation failure guidance must preserve changed-input runs under their original version.'
 Assert-True (-not $runnerText.Contains(
     'Completed preparation left an unexpected archive checkpoint store.'
   )) 'Validated checkpoints must remain available through fitting and evaluation.'
@@ -303,7 +319,7 @@ Assert-True ($runnerText.Contains('pip --isolated check')) `
   'FrozenDraft must check current dependency consistency.'
 Assert-True ($runnerText.Contains('preEvaluationPolicySha256')) `
   'The runner must bind artifact and evaluation to one pre-evaluation policy.'
-Assert-True ($runnerText.Contains('verify-python-v3-artifact.mjs')) `
+Assert-True ($runnerText.Contains('verify-python-artifact.mjs')) `
   'The runner must independently verify Python-to-TypeScript lineage.'
 Assert-True ($runnerText.Contains('Strict cross-runtime lineage verification failed')) `
   'The runner must fail closed when cross-runtime lineage verification fails.'
@@ -325,17 +341,52 @@ Assert-True ($runnerText.Contains('userFacingConfidenceCalibrationClaimSupported
   'The runner must reject an unsupported user-facing calibration claim.'
 
 $crossRuntimeVerifierText = Get-Content -LiteralPath `
-  (Join-Path $repositoryRoot 'scripts\verify-python-v3-artifact.mjs') -Raw
+  (Join-Path $repositoryRoot 'scripts\verify-python-artifact.mjs') -Raw
 Assert-True ($crossRuntimeVerifierText.Contains('external acquisition-manifest digest')) `
   'Cross-runtime verification must bind the external acquisition manifest bytes.'
 Assert-True ($crossRuntimeVerifierText.Contains('corpusPassAudit.passesMatched')) `
   'Cross-runtime verification must require matching prepared-corpus passes.'
-Assert-True ($crossRuntimeVerifierText.Contains('createReadStream')) `
-  'Cross-runtime verification must hash large prepared data as a stream.'
 Assert-True (-not $crossRuntimeVerifierText.Contains('sha256(readFileSync(argumentsByName.get("--prepared")))')) `
   'Cross-runtime verification must not buffer the complete prepared corpus.'
 Assert-True ($crossRuntimeVerifierText.Contains('acquisitionArchiveIndexSha256')) `
   'Cross-runtime verification must recompute the canonical acquisition archive index.'
+Assert-True ($crossRuntimeVerifierText.Contains('validateGapLineage(manifest);')) `
+  'Cross-runtime verification must validate raw gap lineage before deriving the summary.'
+foreach ($requiredGapVerifierText in @(
+  'dataset manifest gapCount must be a nonnegative safe integer',
+  'dataset manifest gapWindowStarts must be an array',
+  'dataset manifest gapWindowStarts length must equal gapCount',
+  'must be a canonical millisecond-Z timestamp',
+  'dataset manifest gapWindowStarts must be strictly sorted and unique',
+  'must align to target durationSeconds',
+  'must fall within the source date range',
+  'must not hide an incomplete UTC day edge'
+)) {
+  Assert-True ($crossRuntimeVerifierText.Contains($requiredGapVerifierText)) `
+    "Cross-runtime gap-lineage validation is missing: $requiredGapVerifierText"
+}
+$preparedAuditText = Get-Content -LiteralPath `
+  (Join-Path $repositoryRoot 'scripts\audit-prepared-model-dataset.mjs') -Raw
+Assert-True ($preparedAuditText.Contains('createReadStream')) `
+  'Cross-runtime verification must audit large prepared data as a stream.'
+Assert-True (-not $preparedAuditText.Contains('readFileSync(path)')) `
+  'Prepared-dataset verification must not buffer the complete corpus.'
+Assert-True ($preparedAuditText.Contains('readFileSync(manifestPath)')) `
+  'The prepared-audit CLI must parse only its bounded JSON manifest synchronously.'
+foreach ($requiredPreparedAuditText in @(
+  'prepared window count does not match gap-adjusted source coverage',
+  'depends on a declared source gap',
+  'has an incomplete decision schedule',
+  'prepared row feature order differs',
+  'dataset partitions do not match the deterministic chronological split'
+)) {
+  Assert-True ($preparedAuditText.Contains($requiredPreparedAuditText)) `
+    "Prepared-dataset cross-runtime audit is missing: $requiredPreparedAuditText"
+}
+& node --test `
+  (Join-Path $repositoryRoot 'scripts\audit-prepared-model-dataset.test.mjs')
+Assert-True ($LASTEXITCODE -eq 0) `
+  'Executable prepared-dataset cross-runtime tamper tests must pass.'
 
 $runbookText = Get-Content -LiteralPath `
   (Join-Path $repositoryRoot 'docs\runbooks\offline-model-training.md') -Raw
@@ -358,12 +409,30 @@ Assert-True (-not $runbookText.Contains('PowerShell tests failed with exit code'
   'The runbook must not inspect stale native exit state after a PowerShell script.'
 Assert-True ($runbookText.Contains('$smokeFailure')) `
   'Verification must preserve its primary failure through smoke cleanup.'
-Assert-True ($runbookText.Contains('^Flippars-v3-smoke-[a-f0-9]{32}$')) `
+Assert-True ($runbookText.Contains('^Flippars-v4-smoke-[a-f0-9]{32}$')) `
   'Smoke cleanup must bind the exact generated temporary directory name.'
 Assert-True ($runbookText.Contains('npm run build --workspace @flippars/contracts')) `
   'Offline training must build the reviewed contracts before model runs.'
 Assert-True ($runbookText.Contains('npm run build --workspace @flippars/model-artifact')) `
   'Offline training must build the artifact schema before model runs.'
+Assert-True ($runbookText.Contains('.resume{0:D2}')) `
+  'Offline recovery must select an immutable numbered whole-signal replacement.'
+Assert-True ($runbookText.Contains('ResumePreflightOnly')) `
+  'Offline recovery must use the runner-owned typed resume preflight.'
+Assert-True ($runbookText.Contains('flippars.model-training-resume-preflight/1')) `
+  'Offline recovery must validate the typed resume-preflight response schema.'
+Assert-True ($runbookText.Contains('Assert-CompletedModelTrainingRun')) `
+  'Offline recovery must verify every exact output before skipping COMPLETE evidence.'
+Assert-True ($runbookText.Contains('Preserving unresumable partial run')) `
+  'Offline recovery must preserve an unresumable partial run before replacement.'
+Assert-True ($runbookText.Contains('audit-prepared-model-dataset.mjs')) `
+  'Verification must independently audit the prepared real-archive dataset.'
+Assert-True ($runbookText.Contains('2023-03-24T15:05:00.000Z')) `
+  'Verification must assert the first eligible window after the reference gap.'
+Assert-True ($runbookText.Contains(
+    'bceaa0b664b055318c22e509d33c04d532da143e7de41ca2fc3457100439c587'
+  )) `
+  'Verification must bind the reference incident to the reviewed archive digest.'
 
 $runnerTokens = $null
 $runnerParseErrors = $null
@@ -376,6 +445,10 @@ Assert-True ($runnerParseErrors.Count -eq 0) `
   "invoke-model-training.ps1 has resume parser errors: $runnerParseErrors"
 foreach ($functionName in @(
   'Get-ModelTrainingRunStartState',
+  'Throw-ModelTrainingResumeReplacementRequired',
+  'Assert-ArchiveResumeSemanticCompatibility',
+  'Get-ArchiveResumeSemanticDisposition',
+  'Assert-PythonArchiveResumeAdmission',
   'Write-ModelTrainingResumeSessionMarker',
   'Remove-CompletedArchiveCheckpointStore'
 )) {
@@ -757,11 +830,579 @@ try {
   }
 }
 
+$semanticResumeRoot = Join-Path $resumeTestBase "Flippars-semantic-resume-$([guid]::NewGuid().ToString('N'))"
+try {
+  $semanticCheckpointRoot = Join-Path $semanticResumeRoot 'checkpoints'
+  $semanticArchivesRoot = Join-Path $semanticCheckpointRoot 'archives'
+  $semanticCheckpointDirectory = Join-Path $semanticArchivesRoot '00000001'
+  New-Item -ItemType Directory -Path $semanticCheckpointDirectory -Force | Out-Null
+  $semanticPipelinePath = Join-Path $semanticResumeRoot 'pipeline.py'
+  $semanticAcquisitionPath = Join-Path $semanticResumeRoot 'acquisition.json'
+  $semanticPreparedPath = Join-Path $semanticResumeRoot 'prepared.jsonl'
+  $semanticManifestPath = Join-Path $semanticResumeRoot 'dataset-manifest.json'
+  [System.IO.File]::WriteAllText(
+    $semanticPipelinePath,
+    "print('semantic resume')" + [Environment]::NewLine,
+    [System.Text.UTF8Encoding]::new($false)
+  )
+  [System.IO.File]::WriteAllText(
+    $semanticAcquisitionPath,
+    '{}' + [Environment]::NewLine,
+    [System.Text.UTF8Encoding]::new($false)
+  )
+  $semanticFingerprint = 'a' * 64
+  $semanticPlan = [ordered]@{
+    schemaVersion = 'flippars.archive-preparation-plan/1'
+    fingerprintSha256 = $semanticFingerprint
+    inputs = [ordered]@{
+      archives = @([ordered]@{ archiveIndex = 1 })
+      acquisitionManifest = [ordered]@{
+        path = $semanticAcquisitionPath
+        sha256 = (Get-FileHash -LiteralPath $semanticAcquisitionPath -Algorithm SHA256).Hash.ToLowerInvariant()
+      }
+      options = [ordered]@{
+        signal_type = 'FIVE_MINUTE_EARLY_DIRECTION'
+        deadband_bps = 5.0
+        timeframe_minutes = 5
+        decision_cadence_seconds = 15
+        minimum_lead_time_seconds = 15
+      }
+      output = $semanticPreparedPath
+      manifestOutput = $semanticManifestPath
+      schemas = [ordered]@{
+        dataset = 'flippars.training-dataset/3'
+        datasetManifest = 'flippars.dataset-manifest/3'
+        feature = 'binance-spot-signal-features/1'
+        labelPolicy = 'binance-spot-trade-close-relation/1'
+        decisionPolicy = 'flippars-signal-candidate-sampling/1'
+      }
+      generator = [ordered]@{
+        packageVersion = '0.3.0'
+        pipelineSha256 = (Get-FileHash -LiteralPath $semanticPipelinePath -Algorithm SHA256).Hash.ToLowerInvariant()
+      }
+    }
+  }
+  $semanticPlan | ConvertTo-Json -Depth 20 |
+    Set-Content -LiteralPath (Join-Path $semanticCheckpointRoot 'plan.json') -Encoding utf8
+  $semanticCheckpoint = [ordered]@{
+    schemaVersion = 'flippars.archive-preparation-checkpoint/2'
+    planFingerprintSha256 = $semanticFingerprint
+  }
+  $semanticCheckpointPath = Join-Path $semanticCheckpointDirectory 'checkpoint.json'
+  $semanticCheckpoint | ConvertTo-Json -Depth 5 |
+    Set-Content -LiteralPath $semanticCheckpointPath -Encoding utf8
+  $semanticParameters = @{
+    CheckpointRoot = $semanticCheckpointRoot
+    PipelinePath = $semanticPipelinePath
+    AcquisitionManifestPath = $semanticAcquisitionPath
+    PreparedPath = $semanticPreparedPath
+    DatasetManifestPath = $semanticManifestPath
+    SignalType = 'FIVE_MINUTE_EARLY_DIRECTION'
+    DeadbandBps = 5.0
+    TimeframeMinutes = 5
+    DecisionCadenceSeconds = 15
+    MinimumLeadTimeSeconds = 15
+    ArchiveCount = 1
+  }
+  $compatibleDisposition = Get-ArchiveResumeSemanticDisposition @semanticParameters
+  Assert-True (
+    $compatibleDisposition.Disposition -ceq 'PYTHON_VALIDATION_REQUIRED' -and
+    $null -eq $compatibleDisposition.Reason
+  ) 'A plan-compatible checkpoint must still require full Python admission.'
+
+  $semanticTemporaryCheckpoint = Join-Path $semanticArchivesRoot `
+    '.00000002.A1-b2_C3.part'
+  New-Item -ItemType Directory -Path $semanticTemporaryCheckpoint | Out-Null
+  $temporaryCheckpointDisposition = Get-ArchiveResumeSemanticDisposition `
+    @semanticParameters
+  Assert-True (
+    $temporaryCheckpointDisposition.Disposition -ceq
+      'PYTHON_VALIDATION_REQUIRED'
+  ) 'A safe abandoned checkpoint temporary must be left for read-only Python admission.'
+  Remove-Item -LiteralPath $semanticTemporaryCheckpoint -Recurse -Force
+
+  Remove-Item -LiteralPath $semanticCheckpointDirectory -Recurse -Force
+  $noCheckpointDisposition = Get-ArchiveResumeSemanticDisposition @semanticParameters
+  Assert-True (
+    $noCheckpointDisposition.Disposition -ceq 'REPLACEMENT_REQUIRED' -and
+    -not [string]::IsNullOrWhiteSpace([string]$noCheckpointDisposition.Reason)
+  ) 'A plan-only run with no durable daily progress must select a replacement.'
+  New-Item -ItemType Directory -Path $semanticCheckpointDirectory -Force | Out-Null
+  $semanticCheckpoint | ConvertTo-Json -Depth 5 |
+    Set-Content -LiteralPath $semanticCheckpointPath -Encoding utf8
+
+  $semanticCheckpoint.schemaVersion = 'flippars.archive-preparation-checkpoint/1'
+  $semanticCheckpoint | ConvertTo-Json -Depth 5 |
+    Set-Content -LiteralPath $semanticCheckpointPath -Encoding utf8
+  $oldCheckpointDisposition = Get-ArchiveResumeSemanticDisposition @semanticParameters
+  Assert-True (
+    $oldCheckpointDisposition.Disposition -ceq 'REPLACEMENT_REQUIRED' -and
+    -not [string]::IsNullOrWhiteSpace([string]$oldCheckpointDisposition.Reason)
+  ) 'An old checkpoint schema must select an immutable replacement.'
+
+  $semanticCheckpoint.schemaVersion = 'flippars.archive-preparation-checkpoint/2'
+  $semanticCheckpoint | ConvertTo-Json -Depth 5 |
+    Set-Content -LiteralPath $semanticCheckpointPath -Encoding utf8
+  $semanticPlan.inputs.generator.pipelineSha256 = 'b' * 64
+  $semanticPlan | ConvertTo-Json -Depth 20 |
+    Set-Content -LiteralPath (Join-Path $semanticCheckpointRoot 'plan.json') -Encoding utf8
+  $changedPipelineDisposition = Get-ArchiveResumeSemanticDisposition @semanticParameters
+  Assert-True (
+    $changedPipelineDisposition.Disposition -ceq 'REPLACEMENT_REQUIRED' -and
+    -not [string]::IsNullOrWhiteSpace([string]$changedPipelineDisposition.Reason)
+  ) 'Changed pipeline bytes must select an immutable replacement.'
+
+  $semanticPlan.inputs.generator.pipelineSha256 = (
+    Get-FileHash -LiteralPath $semanticPipelinePath -Algorithm SHA256
+  ).Hash.ToLowerInvariant()
+  $semanticPlan | ConvertTo-Json -Depth 20 |
+    Set-Content -LiteralPath (Join-Path $semanticCheckpointRoot 'plan.json') -Encoding utf8
+  $semanticCheckpoint.planFingerprintSha256 = 'b' * 64
+  $semanticCheckpoint | ConvertTo-Json -Depth 5 |
+    Set-Content -LiteralPath $semanticCheckpointPath -Encoding utf8
+  Assert-Throws {
+    Get-ArchiveResumeSemanticDisposition @semanticParameters
+  } 'A checkpoint fingerprint contradicting its plan must fail closed as corruption.'
+
+  $semanticCheckpoint.planFingerprintSha256 = $semanticFingerprint
+  $semanticCheckpoint | ConvertTo-Json -Depth 5 |
+    Set-Content -LiteralPath $semanticCheckpointPath -Encoding utf8
+  Remove-Item -LiteralPath (Join-Path $semanticCheckpointRoot 'plan.json') -Force
+  $prePlanDisposition = Get-ArchiveResumeSemanticDisposition @semanticParameters
+  Assert-True (
+    $prePlanDisposition.Disposition -ceq 'REPLACEMENT_REQUIRED' -and
+    -not [string]::IsNullOrWhiteSpace([string]$prePlanDisposition.Reason)
+  ) 'A pre-plan interruption must preserve the stopped run and select a replacement.'
+
+  [System.IO.File]::WriteAllText(
+    (Join-Path $semanticCheckpointRoot 'plan.json'),
+    '{',
+    [System.Text.UTF8Encoding]::new($false)
+  )
+  Assert-Throws {
+    Get-ArchiveResumeSemanticDisposition @semanticParameters
+  } 'Malformed resume state must fail closed rather than select a replacement.'
+} finally {
+  if (Test-Path -LiteralPath $semanticResumeRoot) {
+    $resolvedSemanticRoot = ConvertTo-NormalizedFullPath $semanticResumeRoot
+    if (($resolvedSemanticRoot -eq $resumeTestBase) -or
+        (-not (Test-PathWithin $resolvedSemanticRoot $resumeTestBase))) {
+      throw "Refusing unsafe semantic-resume cleanup: $resolvedSemanticRoot"
+    }
+    Remove-Item -LiteralPath $resolvedSemanticRoot -Recurse -Force
+  }
+}
+
+$resumePreflightRoot = Join-Path $resumeTestBase `
+  "Flippars-resume-preflight-$([guid]::NewGuid().ToString('N'))"
+try {
+  $resumePreflightEnvironmentName = 'fixture-env'
+  $resumePreflightEnvironmentRoot = Join-Path $resumePreflightRoot `
+    $resumePreflightEnvironmentName
+  New-Item -ItemType Directory -Path (
+    Join-Path $resumePreflightEnvironmentRoot 'Scripts'
+  ) -Force | Out-Null
+  [System.IO.File]::WriteAllBytes(
+    (Join-Path $resumePreflightEnvironmentRoot 'Scripts\python.exe'),
+    [byte[]]@()
+  )
+  [System.IO.File]::WriteAllText(
+    (Join-Path $resumePreflightEnvironmentRoot 'environment-manifest.json'),
+    '{}' + [Environment]::NewLine,
+    [System.Text.UTF8Encoding]::new($false)
+  )
+
+  $resumePreflightStart = '2023-01-01'
+  $resumePreflightEnd = '2023-01-02'
+  $resumePreflightVersion = 'btc-spot-preflight-test'
+  $resumePreflightSignalType = 'FIVE_MINUTE_EARLY_DIRECTION'
+  $resumePreflightDatasetRoot = Join-Path $resumePreflightRoot `
+    "datasets\BTCUSDT-$resumePreflightStart--$resumePreflightEnd"
+  $resumePreflightAcquisitionPath = Join-Path $resumePreflightDatasetRoot `
+    'evidence\acquisition-manifest.json'
+  New-Item -ItemType Directory -Path (
+    Split-Path -Parent $resumePreflightAcquisitionPath
+  ) -Force | Out-Null
+  [System.IO.File]::WriteAllText(
+    $resumePreflightAcquisitionPath,
+    '{}' + [Environment]::NewLine,
+    [System.Text.UTF8Encoding]::new($false)
+  )
+
+  $resumePreflightRunKey = `
+    "five-minute-early-direction-$resumePreflightVersion"
+  $resumePreflightProcessedRoot = Join-Path $resumePreflightRoot `
+    "data\processed\runs\$resumePreflightRunKey"
+  $resumePreflightEvidenceRoot = Join-Path $resumePreflightRoot `
+    "evidence\runs\$resumePreflightRunKey"
+  $resumePreflightCheckpointRoot = Join-Path $resumePreflightProcessedRoot `
+    '.prepared.jsonl.archive-checkpoints'
+  $resumePreflightArchivesRoot = Join-Path $resumePreflightCheckpointRoot 'archives'
+  New-Item -ItemType Directory -Path @(
+    $resumePreflightArchivesRoot,
+    $resumePreflightEvidenceRoot
+  ) -Force | Out-Null
+  [System.IO.File]::WriteAllText(
+    (Join-Path $resumePreflightEvidenceRoot 'training-command-output.log'),
+    'prior interruption' + [Environment]::NewLine,
+    [System.Text.UTF8Encoding]::new($false)
+  )
+  $resumePreflightPreparedPath = Join-Path $resumePreflightProcessedRoot `
+    'prepared.jsonl'
+  $resumePreflightManifestPath = Join-Path $resumePreflightProcessedRoot `
+    'dataset-manifest.json'
+  $resumePreflightPipelinePath = Join-Path $repositoryRoot `
+    'apps\model-training\src\flippars_model_training\pipeline.py'
+  $resumePreflightFingerprint = 'd' * 64
+  $resumePreflightPlan = [ordered]@{
+    schemaVersion = 'flippars.archive-preparation-plan/1'
+    fingerprintSha256 = $resumePreflightFingerprint
+    inputs = [ordered]@{
+      archives = @([ordered]@{ archiveIndex = 1 })
+      acquisitionManifest = [ordered]@{
+        path = $resumePreflightAcquisitionPath
+        sha256 = (
+          Get-FileHash -LiteralPath $resumePreflightAcquisitionPath -Algorithm SHA256
+        ).Hash.ToLowerInvariant()
+      }
+      options = [ordered]@{
+        signal_type = $resumePreflightSignalType
+        deadband_bps = 5.0
+        timeframe_minutes = 5
+        decision_cadence_seconds = 15
+        minimum_lead_time_seconds = 15
+      }
+      output = $resumePreflightPreparedPath
+      manifestOutput = $resumePreflightManifestPath
+      schemas = [ordered]@{
+        dataset = 'flippars.training-dataset/3'
+        datasetManifest = 'flippars.dataset-manifest/3'
+        feature = 'binance-spot-signal-features/1'
+        labelPolicy = 'binance-spot-trade-close-relation/1'
+        decisionPolicy = 'flippars-signal-candidate-sampling/1'
+      }
+      generator = [ordered]@{
+        packageVersion = '0.3.0'
+        pipelineSha256 = (
+          Get-FileHash -LiteralPath $resumePreflightPipelinePath -Algorithm SHA256
+        ).Hash.ToLowerInvariant()
+      }
+    }
+  }
+  $resumePreflightPlanPath = Join-Path $resumePreflightCheckpointRoot 'plan.json'
+  $resumePreflightPlan | ConvertTo-Json -Depth 20 |
+    Set-Content -LiteralPath $resumePreflightPlanPath -Encoding utf8
+  $resumePreflightPowerShell = Join-Path `
+    $env:SystemRoot `
+    'System32\WindowsPowerShell\v1.0\powershell.exe'
+  $resumePreflightArguments = @(
+    '-NoProfile',
+    '-ExecutionPolicy', 'Bypass',
+    '-File', (Join-Path $PSScriptRoot 'invoke-model-training.ps1'),
+    '-TrainingRoot', $resumePreflightRoot,
+    '-EnvironmentName', $resumePreflightEnvironmentName,
+    '-Start', $resumePreflightStart,
+    '-End', $resumePreflightEnd,
+    '-SignalType', $resumePreflightSignalType,
+    '-Version', $resumePreflightVersion,
+    '-Mode', 'FrozenDraft',
+    '-Resume',
+    '-ResumePreflightOnly'
+  )
+
+  $compatiblePreflightOutput = @(
+    & $resumePreflightPowerShell @resumePreflightArguments
+  )
+  Assert-True ($LASTEXITCODE -eq 0 -and $compatiblePreflightOutput.Count -eq 1) `
+    'The runner preflight must return one successful plan-only response.'
+  $compatiblePreflight = $compatiblePreflightOutput -join [Environment]::NewLine |
+    ConvertFrom-Json
+  Assert-True (
+    $compatiblePreflight.schemaVersion -ceq
+      'flippars.model-training-resume-preflight/1' -and
+    $compatiblePreflight.disposition -ceq 'REPLACEMENT_REQUIRED' -and
+    $compatiblePreflight.state -ceq 'ArchivePreparation' -and
+    $compatiblePreflight.version -ceq $resumePreflightVersion -and
+    -not [string]::IsNullOrWhiteSpace([string]$compatiblePreflight.reason)
+  ) 'A plan-only runner preflight must replace a run with no durable daily progress.'
+
+  Remove-Item -LiteralPath $resumePreflightPlanPath -Force
+  $prePlanPreflightOutput = @(
+    & $resumePreflightPowerShell @resumePreflightArguments
+  )
+  Assert-True ($LASTEXITCODE -eq 0 -and $prePlanPreflightOutput.Count -eq 1) `
+    'The runner preflight must return one successful pre-plan response.'
+  $prePlanPreflight = $prePlanPreflightOutput -join [Environment]::NewLine |
+    ConvertFrom-Json
+  Assert-True (
+    $prePlanPreflight.disposition -ceq 'REPLACEMENT_REQUIRED' -and
+    -not [string]::IsNullOrWhiteSpace([string]$prePlanPreflight.reason)
+  ) 'The runner preflight must replace an immutable run interrupted before its plan.'
+
+  $resumePreflightPlan.inputs.generator.pipelineSha256 = 'e' * 64
+  $resumePreflightPlan | ConvertTo-Json -Depth 20 |
+    Set-Content -LiteralPath $resumePreflightPlanPath -Encoding utf8
+  $incompatiblePreflightOutput = @(
+    & $resumePreflightPowerShell @resumePreflightArguments
+  )
+  Assert-True (
+    $LASTEXITCODE -eq 0 -and $incompatiblePreflightOutput.Count -eq 1
+  ) 'The runner preflight must return one successful incompatible-plan response.'
+  $incompatiblePreflight = $incompatiblePreflightOutput -join `
+    [Environment]::NewLine | ConvertFrom-Json
+  Assert-True (
+    $incompatiblePreflight.disposition -ceq 'REPLACEMENT_REQUIRED' -and
+    -not [string]::IsNullOrWhiteSpace([string]$incompatiblePreflight.reason)
+  ) 'The runner preflight must replace a run bound to different pipeline bytes.'
+
+  $resumePreflightPlan.inputs.generator.pipelineSha256 = (
+    Get-FileHash -LiteralPath $resumePreflightPipelinePath -Algorithm SHA256
+  ).Hash.ToLowerInvariant()
+  $resumePreflightPlan | ConvertTo-Json -Depth 20 |
+    Set-Content -LiteralPath $resumePreflightPlanPath -Encoding utf8
+  $resumePreflightCheckpointDirectory = Join-Path $resumePreflightArchivesRoot `
+    '00000001'
+  New-Item -ItemType Directory -Path $resumePreflightCheckpointDirectory | Out-Null
+  [ordered]@{
+    schemaVersion = 'flippars.archive-preparation-checkpoint/2'
+    planFingerprintSha256 = 'f' * 64
+  } | ConvertTo-Json -Depth 5 |
+    Set-Content -LiteralPath (
+      Join-Path $resumePreflightCheckpointDirectory 'checkpoint.json'
+    ) -Encoding utf8
+  $previousPreflightErrorActionPreference = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = 'Continue'
+    $corruptPreflightOutput = @(
+      & $resumePreflightPowerShell @resumePreflightArguments 2>&1
+    )
+    $corruptPreflightExitCode = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $previousPreflightErrorActionPreference
+  }
+  Assert-True (
+    $corruptPreflightExitCode -ne 0 -and $corruptPreflightOutput.Count -gt 0
+  ) 'The runner preflight must fail, not replace, contradictory checkpoint state.'
+} finally {
+  if (Test-Path -LiteralPath $resumePreflightRoot) {
+    $resolvedResumePreflightRoot = ConvertTo-NormalizedFullPath `
+      $resumePreflightRoot
+    if (($resolvedResumePreflightRoot -eq $resumeTestBase) -or
+        (-not (Test-PathWithin $resolvedResumePreflightRoot $resumeTestBase))) {
+      throw "Refusing unsafe resume-preflight cleanup: $resolvedResumePreflightRoot"
+    }
+    Remove-Item -LiteralPath $resolvedResumePreflightRoot -Recurse -Force
+  }
+}
+
+$completedRunRoot = Join-Path $resumeTestBase `
+  "Flippars-completed-run-$([guid]::NewGuid().ToString('N'))"
+try {
+  $completedProcessedRoot = Join-Path $completedRunRoot 'processed'
+  $completedArtifactRoot = Join-Path $completedRunRoot 'artifact'
+  $completedEvidenceRoot = Join-Path $completedRunRoot 'evidence'
+  New-Item -ItemType Directory -Path @(
+    $completedProcessedRoot,
+    $completedArtifactRoot,
+    $completedEvidenceRoot
+  ) -Force | Out-Null
+  $completedPreparedPath = Join-Path $completedProcessedRoot 'prepared.jsonl'
+  $completedDatasetManifestPath = Join-Path $completedProcessedRoot 'dataset-manifest.json'
+  $completedCandidatePath = Join-Path $completedArtifactRoot 'candidate.json'
+  $completedEvaluationPath = Join-Path $completedArtifactRoot 'evaluation.json'
+  $completedCommandLogPath = Join-Path $completedEvidenceRoot 'training-command-output.log'
+  $completedCrossRuntimeLogPath = Join-Path $completedEvidenceRoot `
+    'cross-runtime-verification.log'
+  $completedRunManifestPath = Join-Path $completedEvidenceRoot 'run-manifest.json'
+  $completedVersion = 'btc-spot-completed-test'
+  $completedSignalType = 'FIVE_MINUTE_EARLY_DIRECTION'
+  $utf8WithoutBom = [System.Text.UTF8Encoding]::new($false)
+
+  [System.IO.File]::WriteAllText(
+    $completedPreparedPath,
+    '{"row":1}' + [Environment]::NewLine,
+    $utf8WithoutBom
+  )
+  $completedDatasetManifest = [ordered]@{
+    schemaVersion = 'flippars.dataset-manifest/3'
+    symbol = 'BTCUSDT'
+    target = [ordered]@{ signalType = $completedSignalType }
+  }
+  [System.IO.File]::WriteAllText(
+    $completedDatasetManifestPath,
+    ($completedDatasetManifest | ConvertTo-Json -Depth 5) + [Environment]::NewLine,
+    $utf8WithoutBom
+  )
+  [System.IO.File]::WriteAllText(
+    $completedCommandLogPath,
+    'training complete' + [Environment]::NewLine,
+    $utf8WithoutBom
+  )
+  [System.IO.File]::WriteAllText(
+    $completedCrossRuntimeLogPath,
+    'cross-runtime verification complete' + [Environment]::NewLine,
+    $utf8WithoutBom
+  )
+  $completedPreparedSha256 = (
+    Get-FileHash -LiteralPath $completedPreparedPath -Algorithm SHA256
+  ).Hash.ToLowerInvariant()
+  $completedDatasetManifestSha256 = (
+    Get-FileHash -LiteralPath $completedDatasetManifestPath -Algorithm SHA256
+  ).Hash.ToLowerInvariant()
+  $completedPolicySha256 = 'c' * 64
+  $completedCandidate = [ordered]@{
+    schemaVersion = 'flippars.multinomial-candidate/4'
+    version = $completedVersion
+    signalType = $completedSignalType
+    status = 'DRAFT'
+    target = [ordered]@{
+      venue = 'BINANCE'
+      marketType = 'SPOT'
+      symbol = 'BTCUSDT'
+    }
+    approval = [ordered]@{ approvedAt = $null; approvedBy = $null }
+    datasetContentSha256 = $completedPreparedSha256
+    datasetManifestSha256 = $completedDatasetManifestSha256
+    datasetManifest = [ordered]@{
+      datasetContentSha256 = $completedPreparedSha256
+      datasetManifestSha256 = $completedDatasetManifestSha256
+    }
+    preEvaluationPolicySha256 = $completedPolicySha256
+  }
+  [System.IO.File]::WriteAllText(
+    $completedCandidatePath,
+    ($completedCandidate | ConvertTo-Json -Depth 8) + [Environment]::NewLine,
+    $utf8WithoutBom
+  )
+  $completedEvaluation = [ordered]@{
+    schemaVersion = 'flippars.model-evaluation/4'
+    artifactSchemaVersion = 'flippars.multinomial-candidate/4'
+    version = $completedVersion
+    signalType = $completedSignalType
+    status = 'DRAFT'
+    productionEligible = $false
+    evaluationScope = 'BINANCE_CONDITIONAL_DETERMINISTIC_WINDOW_SAMPLE_DIAGNOSTIC_ONLY'
+    datasetSha256 = $completedPreparedSha256
+    datasetManifestSha256 = $completedDatasetManifestSha256
+    preEvaluationPolicySha256 = $completedPolicySha256
+  }
+  [System.IO.File]::WriteAllText(
+    $completedEvaluationPath,
+    ($completedEvaluation | ConvertTo-Json -Depth 8) + [Environment]::NewLine,
+    $utf8WithoutBom
+  )
+  $completedOutputPaths = @(
+    $completedPreparedPath,
+    $completedDatasetManifestPath,
+    $completedCandidatePath,
+    $completedEvaluationPath,
+    $completedCommandLogPath,
+    $completedCrossRuntimeLogPath
+  )
+  $completedRunManifest = [ordered]@{
+    schemaVersion = 2
+    completionState = 'COMPLETE'
+    target = [ordered]@{
+      venue = 'BINANCE'
+      marketType = 'SPOT'
+      symbol = 'BTCUSDT'
+      signalType = $completedSignalType
+    }
+    outputs = @(
+      $completedOutputPaths | ForEach-Object { Get-Sha256Record $_ }
+    )
+    lifecycle = [ordered]@{
+      artifactStatus = 'DRAFT'
+      signalsEnabled = $false
+      promotionAttempted = $false
+    }
+  }
+  [System.IO.File]::WriteAllText(
+    $completedRunManifestPath,
+    ($completedRunManifest | ConvertTo-Json -Depth 10) + [Environment]::NewLine,
+    $utf8WithoutBom
+  )
+  $completedVerificationParameters = @{
+    RunManifestPath = $completedRunManifestPath
+    PreparedPath = $completedPreparedPath
+    DatasetManifestPath = $completedDatasetManifestPath
+    CandidatePath = $completedCandidatePath
+    EvaluationPath = $completedEvaluationPath
+    CommandLogPath = $completedCommandLogPath
+    CrossRuntimeLogPath = $completedCrossRuntimeLogPath
+    ExpectedVersion = $completedVersion
+    ExpectedSignalType = $completedSignalType
+  }
+  $verifiedCompletedRun = Assert-CompletedModelTrainingRun `
+    @completedVerificationParameters
+  Assert-True (
+    $verifiedCompletedRun.completionState -ceq 'COMPLETE'
+  ) 'A complete six-output run with consistent identity and hashes must be accepted.'
+
+  $completedRunManifest.outputs[0].Path = Join-Path $completedProcessedRoot `
+    '.\prepared.jsonl'
+  [System.IO.File]::WriteAllText(
+    $completedRunManifestPath,
+    ($completedRunManifest | ConvertTo-Json -Depth 10) + [Environment]::NewLine,
+    $utf8WithoutBom
+  )
+  Assert-Throws {
+    Assert-CompletedModelTrainingRun @completedVerificationParameters
+  } 'COMPLETE evidence must reject a relative or noncanonical recorded output path.'
+  $completedRunManifest.outputs[0].Path = $completedPreparedPath
+  [System.IO.File]::WriteAllText(
+    $completedRunManifestPath,
+    ($completedRunManifest | ConvertTo-Json -Depth 10) + [Environment]::NewLine,
+    $utf8WithoutBom
+  )
+  $completedRunManifest.lifecycle.signalsEnabled = 'false'
+  [System.IO.File]::WriteAllText(
+    $completedRunManifestPath,
+    ($completedRunManifest | ConvertTo-Json -Depth 10) + [Environment]::NewLine,
+    $utf8WithoutBom
+  )
+  Assert-Throws {
+    Assert-CompletedModelTrainingRun @completedVerificationParameters
+  } 'COMPLETE evidence must reject a string that only coerces to Boolean false.'
+  $completedRunManifest.lifecycle.signalsEnabled = $false
+  $completedRecordedBytes = [long]$completedRunManifest.outputs[0].Bytes
+  $completedRunManifest.outputs[0].Bytes = [double]$completedRecordedBytes + 0.4
+  [System.IO.File]::WriteAllText(
+    $completedRunManifestPath,
+    ($completedRunManifest | ConvertTo-Json -Depth 10) + [Environment]::NewLine,
+    $utf8WithoutBom
+  )
+  Assert-Throws {
+    Assert-CompletedModelTrainingRun @completedVerificationParameters
+  } 'COMPLETE evidence must reject a fractional byte count that rounds to the file size.'
+  $completedRunManifest.outputs[0].Bytes = $completedRecordedBytes
+  [System.IO.File]::WriteAllText(
+    $completedRunManifestPath,
+    ($completedRunManifest | ConvertTo-Json -Depth 10) + [Environment]::NewLine,
+    $utf8WithoutBom
+  )
+  Remove-Item -LiteralPath $completedCrossRuntimeLogPath -Force
+  Assert-Throws {
+    Assert-CompletedModelTrainingRun @completedVerificationParameters
+  } 'COMPLETE evidence missing any recorded governed output must fail closed.'
+} finally {
+  if (Test-Path -LiteralPath $completedRunRoot) {
+    $resolvedCompletedRunRoot = ConvertTo-NormalizedFullPath $completedRunRoot
+    if (($resolvedCompletedRunRoot -eq $resumeTestBase) -or
+        (-not (Test-PathWithin $resolvedCompletedRunRoot $resumeTestBase))) {
+      throw "Refusing unsafe completed-run test cleanup: $resolvedCompletedRunRoot"
+    }
+    Remove-Item -LiteralPath $resolvedCompletedRunRoot -Recurse -Force
+  }
+}
+
 $nativeTestId = [guid]::NewGuid().ToString('N')
 $nativeExitLog = Join-Path ([System.IO.Path]::GetTempPath()) `
   "Flippars-native-exit-$nativeTestId.log"
 $nativeChildScript = Join-Path ([System.IO.Path]::GetTempPath()) `
   "Flippars-native-child-$nativeTestId.ps1"
+$nativeOverflowMarker = Join-Path ([System.IO.Path]::GetTempPath()) `
+  "Flippars-native-overflow-$nativeTestId.marker"
 try {
   $childPowerShell = Join-Path `
     $env:SystemRoot `
@@ -772,14 +1413,57 @@ try {
   $nativeChildText = @'
 [CmdletBinding()]
 param(
-  [ValidateSet('Failure', 'Append')][string]$Mode = 'Failure',
+  [ValidateSet('Failure', 'Append', 'Sized', 'Utf8')][string]$Mode = 'Failure',
   [AllowEmptyString()][string]$ArgumentProbe = '',
-  [AllowEmptyString()][string]$EmptyProbe = 'not-empty'
+  [AllowEmptyString()][string]$EmptyProbe = 'not-empty',
+  [ValidateRange(0, 1048576)][int]$StdoutBytes = 0,
+  [ValidateRange(0, 1048576)][int]$StderrBytes = 0
 )
+
+function Write-RawAscii {
+  param(
+    [Parameter(Mandatory)][System.IO.Stream]$Stream,
+    [ValidateRange(0, 1048576)][int]$Count,
+    [Parameter(Mandatory)][byte]$Value
+  )
+  $buffer = [byte[]]::new(8192)
+  for ($index = 0; $index -lt $buffer.Length; $index += 1) {
+    $buffer[$index] = $Value
+  }
+  $remaining = $Count
+  while ($remaining -gt 0) {
+    $writeCount = [Math]::Min($buffer.Length, $remaining)
+    $Stream.Write($buffer, 0, $writeCount)
+    $remaining -= $writeCount
+  }
+  $Stream.Flush()
+}
 
 if ($Mode -eq 'Append') {
   [Console]::Out.WriteLine('APPEND-STDOUT')
   [Console]::Error.WriteLine('APPEND-STDERR')
+  exit 0
+}
+
+if ($Mode -eq 'Sized') {
+  Write-RawAscii ([Console]::OpenStandardOutput()) $StdoutBytes ([byte][char]'O')
+  Write-RawAscii ([Console]::OpenStandardError()) $StderrBytes ([byte][char]'E')
+  if ($ArgumentProbe.Length -gt 0) {
+    Start-Sleep -Seconds 10
+    [System.IO.File]::WriteAllText($ArgumentProbe, 'CAPTURE-LIMIT-NOT-ENFORCED')
+  }
+  exit 0
+}
+
+if ($Mode -eq 'Utf8') {
+  $bytes = [byte[]](0xE2, 0x82, 0xAC)
+  $output = [Console]::OpenStandardOutput()
+  $output.Write($bytes, 0, $bytes.Length)
+  $output.Flush()
+  if ($ArgumentProbe.Length -gt 0) {
+    Start-Sleep -Seconds 10
+    [System.IO.File]::WriteAllText($ArgumentProbe, 'CAPTURE-LIMIT-NOT-ENFORCED')
+  }
   exit 0
 }
 
@@ -802,6 +1486,86 @@ exit 17
     $nativeChildText,
     [System.Text.UTF8Encoding]::new($false)
   )
+
+  $capturedNativeResult = Invoke-CapturedNativeProcess `
+    -FilePath $childPowerShell `
+    -ArgumentList @(
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+      '-File', $nativeChildScript, '-Mode', 'Append'
+    ) `
+    -WorkingDirectory ([System.IO.Path]::GetTempPath())
+  Assert-True (
+    $capturedNativeResult.ExitCode -eq 0 -and
+    $capturedNativeResult.Stdout.Contains('APPEND-STDOUT') -and
+    $capturedNativeResult.Stderr.Contains('APPEND-STDERR')
+  ) 'The bounded native capture helper must preserve separate stdout and stderr.'
+
+  $exactBoundary = Invoke-CapturedNativeProcess `
+    -FilePath $childPowerShell `
+    -ArgumentList @(
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+      '-File', $nativeChildScript, '-Mode', 'Sized',
+      '-StdoutBytes', '524288', '-StderrBytes', '524288'
+    ) `
+    -WorkingDirectory ([System.IO.Path]::GetTempPath())
+  Assert-True (
+    $exactBoundary.ExitCode -eq 0 -and
+    $exactBoundary.Stdout.Length -eq 524288 -and
+    $exactBoundary.Stderr.Length -eq 524288
+  ) 'The bounded native capture helper must accept exactly 1,048,576 ASCII bytes.'
+
+  $utf8Boundary = Invoke-CapturedNativeProcess `
+    -FilePath $childPowerShell `
+    -ArgumentList @(
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+      '-File', $nativeChildScript, '-Mode', 'Utf8'
+    ) `
+    -WorkingDirectory ([System.IO.Path]::GetTempPath()) `
+    -MaxCombinedBytes 3
+  Assert-True ($utf8Boundary.Stdout -ceq ([string][char]0x20AC)) `
+    'The bounded native capture helper must decode admitted UTF-8 bytes exactly.'
+
+  $overflowFailure = $null
+  try {
+    Invoke-CapturedNativeProcess `
+      -FilePath $childPowerShell `
+      -ArgumentList @(
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-File', $nativeChildScript, '-Mode', 'Sized',
+        '-StdoutBytes', '600000', '-StderrBytes', '448577',
+        '-ArgumentProbe', $nativeOverflowMarker
+      ) `
+      -WorkingDirectory ([System.IO.Path]::GetTempPath()) | Out-Null
+  } catch {
+    $overflowFailure = $_
+  }
+  Assert-True (
+    $null -ne $overflowFailure -and
+    $overflowFailure.Exception.Message.Contains(
+      'combined output limit of 1048576 bytes'
+    )
+  ) 'The bounded native capture helper must reject one byte over its live combined cap.'
+  Assert-True (-not (Test-Path -LiteralPath $nativeOverflowMarker)) `
+    'The bounded native capture helper must terminate the child before overflow completes.'
+
+  $multibyteFailure = $null
+  try {
+    Invoke-CapturedNativeProcess `
+      -FilePath $childPowerShell `
+      -ArgumentList @(
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-File', $nativeChildScript, '-Mode', 'Utf8',
+        '-ArgumentProbe', $nativeOverflowMarker
+      ) `
+      -WorkingDirectory ([System.IO.Path]::GetTempPath()) `
+      -MaxCombinedBytes 2 | Out-Null
+  } catch {
+    $multibyteFailure = $_
+  }
+  Assert-True ($null -ne $multibyteFailure) `
+    'The bounded native capture helper must count multibyte UTF-8 as raw bytes.'
+  Assert-True (-not (Test-Path -LiteralPath $nativeOverflowMarker)) `
+    'A multibyte overflow must terminate the child before delayed side effects.'
 
   $argumentProbe = 'space "quote" trailing\'
   $originalConsoleOut = [Console]::Out
@@ -894,6 +1658,9 @@ exit 17
   }
   if (Test-Path -LiteralPath $nativeChildScript) {
     Remove-Item -LiteralPath $nativeChildScript -Force
+  }
+  if (Test-Path -LiteralPath $nativeOverflowMarker) {
+    Remove-Item -LiteralPath $nativeOverflowMarker -Force
   }
   $global:LASTEXITCODE = 0
 }

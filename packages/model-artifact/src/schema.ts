@@ -6,7 +6,8 @@ import {
   BinanceSpotForecastTargetSchema,
   BinanceSpotRuntimeCompatibilitySchema,
   BinanceSpotSignalFeatureNamesSchema,
-  DatasetManifestSummarySchema,
+  DatasetManifestSummaryV3Schema,
+  DatasetManifestSummaryV4Schema,
 } from "@flippars/contracts";
 
 const MEBIBYTE = 1_048_576;
@@ -215,10 +216,10 @@ export type FitSupportEnvelope = z.infer<typeof FitSupportEnvelopeSchema>;
 
 /**
  * Additive Binance Spot target contract. V2 remains readable for historical
- * dry-run evidence, but only V3 binds target, features, labels, and dataset
- * metadata tightly enough for the Binance-target research path.
+ * dry-run evidence. V3 is the gap-free historical reader; V4 preserves those
+ * bindings while adding explicit gap-aware dataset lineage.
  */
-export const DraftBinanceMultinomialArtifactSchema = z
+export const DraftBinanceMultinomialArtifactV3Schema = z
   .object({
     schemaVersion: z.literal("flippars.multinomial-candidate/3"),
     artifactId: IdentifierSchema,
@@ -260,7 +261,7 @@ export const DraftBinanceMultinomialArtifactSchema = z
     ood: FitSupportEnvelopeSchema,
     datasetContentSha256: Sha256HexSchema,
     datasetManifestSha256: Sha256HexSchema,
-    datasetManifest: DatasetManifestSummarySchema,
+    datasetManifest: DatasetManifestSummaryV3Schema,
     preEvaluationPolicySha256: Sha256HexSchema,
     trainingCodeSha256: Sha256HexSchema,
     approval: z
@@ -409,13 +410,78 @@ export const DraftBinanceMultinomialArtifactSchema = z
     }
   });
 
+export type DraftBinanceMultinomialArtifactV3 = z.infer<
+  typeof DraftBinanceMultinomialArtifactV3Schema
+>;
+
+export type DraftBinanceMultinomialArtifactV4 = Omit<
+  DraftBinanceMultinomialArtifactV3,
+  "schemaVersion" | "datasetManifest"
+> & {
+  schemaVersion: "flippars.multinomial-candidate/4";
+  datasetManifest: z.infer<typeof DatasetManifestSummaryV4Schema>;
+};
+
+export const DraftBinanceMultinomialArtifactV4Schema = z
+  .unknown()
+  .superRefine((value, context) => {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "V4 artifact must be an object",
+      });
+      return;
+    }
+    const record = value as Record<string, unknown>;
+    if (record.schemaVersion !== "flippars.multinomial-candidate/4") {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["schemaVersion"],
+        message: "Expected Binance multinomial candidate V4",
+      });
+      return;
+    }
+    const summaryResult = DatasetManifestSummaryV4Schema.safeParse(
+      record.datasetManifest,
+    );
+    if (!summaryResult.success) {
+      for (const issue of summaryResult.error.issues) {
+        context.addIssue({
+          ...issue,
+          path: ["datasetManifest", ...issue.path],
+        });
+      }
+      return;
+    }
+    const compatibilityResult = DraftBinanceMultinomialArtifactV3Schema.safeParse({
+      ...record,
+      schemaVersion: "flippars.multinomial-candidate/3",
+      datasetManifest: {
+        ...summaryResult.data,
+        schemaVersion: "flippars.dataset-manifest-summary/3",
+        gapCount: 0,
+      },
+    });
+    if (!compatibilityResult.success) {
+      for (const issue of compatibilityResult.error.issues) {
+        context.addIssue(issue);
+      }
+    }
+  })
+  .transform((value) => value as DraftBinanceMultinomialArtifactV4);
+
+export const DraftBinanceMultinomialArtifactSchema = z.union([
+  DraftBinanceMultinomialArtifactV3Schema,
+  DraftBinanceMultinomialArtifactV4Schema,
+]);
 export type DraftBinanceMultinomialArtifact = z.infer<
   typeof DraftBinanceMultinomialArtifactSchema
 >;
 
 export const DraftModelArtifactSchema = z.union([
   DraftMultinomialArtifactSchema,
-  DraftBinanceMultinomialArtifactSchema,
+  DraftBinanceMultinomialArtifactV3Schema,
+  DraftBinanceMultinomialArtifactV4Schema,
 ]);
 export type DraftModelArtifact = z.infer<typeof DraftModelArtifactSchema>;
 

@@ -52,14 +52,15 @@ Before constructing an approval bundle for a signal type:
    canary period. Recalibrating changes the governed artifact and requires a new
    manifest and appropriate revalidation.
 
-The repository now contains an offline Binance-trade training path and additive
-V3 three-class candidate/manifest contracts. Those pieces produce and validate
-draft research material only. The live causal feature/risk provider, Binance
+The repository now contains an offline Binance-trade training path, historical
+V3 three-class candidate/manifest readers, and a gap-aware V4 draft candidate
+contract. V4 deliberately has no promotion-bundle contract. These pieces produce
+and validate draft research material only. The live causal feature/risk provider, Binance
 trade-based outcome evaluator, prospective shadow recorder, governed registrar,
 and runtime migration do not exist. Until those components arrive and their
 evidence is independently accepted, this prerequisite list cannot pass. V2
 remains parseable for historical dry-run compatibility and is not target-parity
-evidence for V3.
+evidence for either V3 or V4.
 
 ## Bundle and keyring
 

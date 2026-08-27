@@ -2,7 +2,8 @@
 
 This package implements the offline research path for Binance Spot `BTCUSDT`.
 It consumes public daily trade archives and can produce only immutable
-`flippars.multinomial-candidate/3` `DRAFT` artifacts. It never accepts exchange
+`flippars.multinomial-candidate/4` `DRAFT` artifacts. Historical gap-free V3
+artifacts remain readable, but this producer does not emit them. It never accepts exchange
 credentials, places trades, approves a model, enables signals, or promotes an
 artifact.
 
@@ -28,11 +29,15 @@ the download-capable `collect` or `all` command.
 
 `scripts/invoke-model-training.ps1 -Resume` is an explicit same-version
 recovery path, not an overwrite switch. It accepts only a strictly classified
-incomplete archive-preparation state or a complete prepared dataset pair with
-no artifact output. Archive preparation continues after the last validated
-daily checkpoint; fitting always restarts from epoch zero. Ambiguous files,
-changed inputs, partial artifacts, or completed evidence fail closed and must
-be preserved under their original version.
+archive-preparation state with at least one durable daily checkpoint and no
+artifact output. The runner's read-only `preflight-archive-resume` command
+reuses the exact Python plan, chunk, digest, chain, source, and published-output
+validators before returning `RESUMABLE`. A plan-only interruption or a
+standalone prepared pair without its durable checkpoint plan selects a new
+immutable version. Archive preparation continues after the last validated daily
+checkpoint; fitting always restarts from epoch zero. Ambiguous files, changed
+inputs, partial artifacts, or completed evidence fail closed and must be
+preserved under their original version.
 
 ## CLI boundaries
 
@@ -62,7 +67,7 @@ be preserved under their original version.
   multinomial-logistic baseline, calibrates it with equal window weight, freezes
   baseline/threshold policy before computing or inspecting holdout outcome
   statistics or metrics, replays first-qualified
-  alerts with OOD/data-health abstention, and writes a strict V3 draft plus
+  alerts with OOD/data-health abstention, and writes a strict V4 draft plus
   diagnostic evaluation.
 - `all` exists for bounded exploration only because it includes acquisition. It
   is forbidden in `FrozenDraft` operations.
@@ -109,8 +114,9 @@ XGBoost exploration uses `requirements-challengers.txt` and a separate
 artifact/runtime contract without a versioned serving implementation,
 independent validation, and governance approval.
 
-The model-artifact verifier deliberately rejects the V3 candidate/manifest pair
-as offline-only. Live Binance trade feature parity, receive-time health,
+The model-artifact verifier preserves the historical V3 reader. The new V4
+candidate has no promotion bundle contract and remains offline-only. Live Binance
+trade feature parity, receive-time health,
 cross-venue quorum history, prospective shadow evidence, drift monitoring,
 independent approval, registration, canary, rollback, and user-comprehension
 gates remain required before public alerts can be considered.
