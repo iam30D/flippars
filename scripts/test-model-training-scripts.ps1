@@ -120,6 +120,14 @@ Assert-True ($setupText.Contains('--require-hashes')) 'Locked setup must require
 Assert-True ($setupText.Contains('--only-binary=:all:')) 'Setup must accept binary wheels only.'
 Assert-True ($setupText.Contains('semanticLock')) `
   'Locked setup must validate semantic lock evidence.'
+Assert-True ($setupText.Contains('[string]$PythonExecutable')) `
+  'Setup must support an explicitly selected installed Python executable.'
+Assert-True ($setupText.Contains('Get-PythonRuntimeCompatibility $explicitPythonPath')) `
+  'Setup must probe the exact explicit Python runtime before environment creation.'
+Assert-True ($setupText.Contains('Explicit Python compatibility field')) `
+  'Locked setup must bind every explicit Python identity field to semantic lock evidence.'
+Assert-True ($setupText.Contains('& $explicitPythonPath -m venv $environmentPath')) `
+  'Environment creation must invoke the validated explicit Python executable directly.'
 Assert-True ($setupText.Contains("completionState = 'COMPLETE'")) `
   'Environment evidence must record an explicit complete state.'
 

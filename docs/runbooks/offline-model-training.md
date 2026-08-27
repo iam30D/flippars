@@ -342,13 +342,15 @@ Write-Host "Model-training implementation verification completed successfully." 
 }
 ```
 
-## User-run block A: online setup and public-data acquisition
+## User-run block A: frozen environment and public-data acquisition/reuse
 
-This is intentionally a User-run operation: it installs dependencies, downloads
-and hashes wheels/checksum sidecars or missing archives, and may run for hours.
-It reuses verified files already in `C:\Users\HP\Flippars-ml\data\raw\archives`
-and does not redownload a valid archive. Paste the whole block once in
-PowerShell after the implementation commit is clean:
+This is intentionally a User-run operation: it creates an environment and, only
+when immutable dependency or dataset evidence is absent, downloads and hashes
+wheels, checksum sidecars, or missing archives. It reuses a complete semantic
+lock, wheelhouse, and isolated dataset already under
+`C:\Users\HP\Flippars-ml`; it does not recreate immutable evidence or redownload
+valid archive bytes. Paste the whole block once in PowerShell after the
+implementation commit is clean:
 
 ```powershell
 & {
@@ -359,18 +361,25 @@ try {
 Set-Location -LiteralPath "C:\Users\HP\Downloads\Flippars"
 
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+. .\scripts\model-training-guardrails.ps1
 
 $trainingRoot = "C:\Users\HP\Flippars-ml"
 $bootstrapEnvironment = "bootstrap-env-v5"
 $finalEnvironment = "final-env-v5"
+$pythonExecutable = "C:\Users\HP\AppData\Local\Programs\Python\Python311\python.exe"
 $dependencyProfile = "GovernedBaseline"
 $platformKey = "cp311-win_amd64"
 $lockFile = Join-Path $trainingRoot "locks\governed-baseline\$platformKey\requirements.lock.txt"
+$semanticLockFile = "$lockFile.manifest.json"
 $wheelhouse = Join-Path $trainingRoot "wheelhouse\governed-baseline\$platformKey"
 $archiveCache = Join-Path $trainingRoot "data\raw\archives"
 $start = "2022-01-01"
 $end = "2026-08-02"
 $maxFiles = 1700
+$datasetRoot = Join-Path $trainingRoot "datasets\BTCUSDT-$start--$end"
+$environmentManifest = Join-Path $trainingRoot "$finalEnvironment\environment-manifest.json"
+$acquisitionManifest = Join-Path $datasetRoot "evidence\acquisition-manifest.json"
+$sourceIntegrity = Join-Path $datasetRoot "evidence\source-integrity.json"
 
 Write-Host "Checking reviewed repository state..." -ForegroundColor Cyan
 $status = @(git status --porcelain=v1 --untracked-files=all)
@@ -381,21 +390,37 @@ if ($status.Count -ne 0) {
 npm run repo:check
 if ($LASTEXITCODE -ne 0) { throw "Repository check failed with exit code $LASTEXITCODE" }
 
-Write-Host "Creating online GovernedBaseline bootstrap environment..." -ForegroundColor Cyan
-& .\scripts\setup-model-environment.ps1 `
-  -TrainingRoot $trainingRoot `
-  -Mode Bootstrap `
-  -DependencyProfile $dependencyProfile `
-  -EnvironmentName $bootstrapEnvironment `
-  -PythonVersion 3.11
+$lockedDependencyInputs = @(
+  (Test-Path -LiteralPath $lockFile -PathType Leaf),
+  (Test-Path -LiteralPath $semanticLockFile -PathType Leaf),
+  (Test-Path -LiteralPath $wheelhouse -PathType Container)
+)
+$lockedDependencyInputCount = @(
+  $lockedDependencyInputs | Where-Object { $_ }
+).Count
+if ($lockedDependencyInputCount -notin @(0, 3)) {
+  throw "Frozen dependency evidence is partial. Preserve and inspect it; do not overwrite immutable paths."
+}
+if ($lockedDependencyInputCount -eq 0) {
+  Write-Host "Creating online GovernedBaseline bootstrap environment..." -ForegroundColor Cyan
+  & .\scripts\setup-model-environment.ps1 `
+    -TrainingRoot $trainingRoot `
+    -Mode Bootstrap `
+    -DependencyProfile $dependencyProfile `
+    -EnvironmentName $bootstrapEnvironment `
+    -PythonVersion 3.11 `
+    -PythonExecutable $pythonExecutable
 
-Write-Host "Resolving exact wheels and semantic lock evidence..." -ForegroundColor Cyan
-& .\scripts\new-model-training-lock.ps1 `
-  -TrainingRoot $trainingRoot `
-  -BootstrapEnvironmentName $bootstrapEnvironment `
-  -DependencyProfile $dependencyProfile `
-  -LockFile $lockFile `
-  -Wheelhouse $wheelhouse
+  Write-Host "Resolving exact wheels and semantic lock evidence..." -ForegroundColor Cyan
+  & .\scripts\new-model-training-lock.ps1 `
+    -TrainingRoot $trainingRoot `
+    -BootstrapEnvironmentName $bootstrapEnvironment `
+    -DependencyProfile $dependencyProfile `
+    -LockFile $lockFile `
+    -Wheelhouse $wheelhouse
+} else {
+  Write-Host "Reusing complete immutable dependency evidence; no wheel download is needed." -ForegroundColor Green
+}
 
 Write-Host "Creating the hash-locked final environment with no package index..." -ForegroundColor Cyan
 & .\scripts\setup-model-environment.ps1 `
@@ -404,21 +429,64 @@ Write-Host "Creating the hash-locked final environment with no package index..."
   -DependencyProfile $dependencyProfile `
   -EnvironmentName $finalEnvironment `
   -PythonVersion 3.11 `
+  -PythonExecutable $pythonExecutable `
   -LockFile $lockFile `
   -Wheelhouse $wheelhouse
 
-Write-Host "Acquiring/reusing and verifying the exact Binance corpus..." -ForegroundColor Cyan
-& .\scripts\get-binance-training-data.ps1 `
-  -TrainingRoot $trainingRoot `
-  -EnvironmentName $finalEnvironment `
-  -ArchiveCache $archiveCache `
-  -Start $start `
-  -End $end `
-  -MaxFiles $maxFiles
+if (Test-Path -LiteralPath $datasetRoot -PathType Container) {
+  Write-Host "Validating reusable immutable Binance acquisition evidence..." -ForegroundColor Cyan
+  foreach ($requiredDatasetEvidence in @($acquisitionManifest, $sourceIntegrity)) {
+    if (-not (Test-Path -LiteralPath $requiredDatasetEvidence -PathType Leaf)) {
+      throw "The existing immutable dataset is incomplete: $requiredDatasetEvidence"
+    }
+    $item = Get-Item -LiteralPath $requiredDatasetEvidence -Force
+    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+      throw "Dataset evidence cannot be a reparse point: $requiredDatasetEvidence"
+    }
+  }
+  $acquisition = Get-Content -LiteralPath $acquisitionManifest -Raw |
+    ConvertFrom-Json
+  $sourceIntegrityHash = (
+    Get-FileHash -LiteralPath $sourceIntegrity -Algorithm SHA256
+  ).Hash.ToLowerInvariant()
+  if (([int]$acquisition.schemaVersion -ne 3) -or
+      ($acquisition.completionState -ne "COMPLETE") -or
+      ($acquisition.freshOfficialTransportEvidence -isnot [bool]) -or
+      (-not $acquisition.freshOfficialTransportEvidence) -or
+      ($acquisition.credentialsUsed -isnot [bool]) -or
+      $acquisition.credentialsUsed -or
+      ($acquisition.tradingApiUsed -isnot [bool]) -or
+      $acquisition.tradingApiUsed -or
+      ($acquisition.source.provider -ne "Binance Data Vision") -or
+      ($acquisition.source.marketType -ne "SPOT") -or
+      ($acquisition.source.symbol -ne "BTCUSDT") -or
+      ($acquisition.source.dataKind -ne "DAILY_TRADES") -or
+      ($acquisition.window.startInclusive -ne $start) -or
+      ($acquisition.window.endExclusive -ne $end) -or
+      ([int]$acquisition.window.dayCount -ne 1674) -or
+      (@($acquisition.archives).Count -ne 1674) -or
+      ((ConvertTo-NormalizedFullPath ([string]$acquisition.archiveRoot)) -ne
+       (ConvertTo-NormalizedFullPath (Join-Path $datasetRoot "raw\archives"))) -or
+      ((ConvertTo-NormalizedFullPath ([string]$acquisition.isolatedIntegrity.Path)) -ne
+       (ConvertTo-NormalizedFullPath $sourceIntegrity)) -or
+      (([string]$acquisition.isolatedIntegrity.Sha256).ToLowerInvariant() -ne
+       $sourceIntegrityHash)) {
+    throw "The existing immutable Binance acquisition evidence is incomplete or incompatible."
+  }
+  Write-Host "Reusing complete acquisition evidence; no archive download is needed." -ForegroundColor Green
+} elseif (Test-Path -LiteralPath $datasetRoot) {
+  throw "The immutable dataset path exists but is not a directory: $datasetRoot"
+} else {
+  Write-Host "Acquiring/reusing and verifying the exact Binance corpus..." -ForegroundColor Cyan
+  & .\scripts\get-binance-training-data.ps1 `
+    -TrainingRoot $trainingRoot `
+    -EnvironmentName $finalEnvironment `
+    -ArchiveCache $archiveCache `
+    -Start $start `
+    -End $end `
+    -MaxFiles $maxFiles
+}
 
-$datasetRoot = Join-Path $trainingRoot "datasets\BTCUSDT-$start--$end"
-$environmentManifest = Join-Path $trainingRoot "$finalEnvironment\environment-manifest.json"
-$acquisitionManifest = Join-Path $datasetRoot "evidence\acquisition-manifest.json"
 foreach ($requiredEvidence in @($environmentManifest, $acquisitionManifest)) {
   if (-not (Test-Path -LiteralPath $requiredEvidence -PathType Leaf)) {
     throw "Required evidence was not produced: $requiredEvidence"
@@ -436,19 +504,23 @@ Write-Warning "Stop outbound access before running block B. No training has run 
 }
 ```
 
-The bootstrap is not governed training evidence. The final environment accepts
-only the exact binary wheels in the semantic lock using `--no-index`,
-`--require-hashes`, and `--only-binary=:all:`. Any changed requirement, wheel,
-Python ABI/platform, repository commit, or governed source digest fails closed.
+The bootstrap is not governed training evidence and is skipped when the
+complete immutable semantic lock and wheelhouse already exist. The final
+environment accepts only the exact binary wheels in that lock using
+`--no-index`, `--require-hashes`, and `--only-binary=:all:`. Any partial frozen
+dependency evidence, changed requirement, wheel, Python ABI/platform,
+repository commit, or governed source digest fails closed.
 
-Acquisition freshly retrieves and atomically replaces every selected official
-checksum sidecar, pins both requested and final response URIs to HTTPS
-`data.binance.vision`, and verifies the selected cache against those bytes. It
-reuses valid archive bytes and invokes the download-capable collector only for
-missing dates. The isolated dataset uses hard links by default to avoid
-duplicating tens of gigabytes; scripts never modify those bytes in place. Use
-`-CopyArchives` only after confirming capacity when physical isolation is
-required.
+When the immutable dataset is absent, acquisition freshly retrieves and
+atomically replaces every selected official checksum sidecar, pins both
+requested and final response URIs to HTTPS `data.binance.vision`, and verifies
+the selected cache against those bytes. It reuses valid archive bytes and
+invokes the download-capable collector only for missing dates. A complete
+existing acquisition manifest and its bound source-integrity evidence are
+validated and reused without network access. The isolated dataset uses hard
+links by default to avoid duplicating tens of gigabytes; scripts never modify
+those bytes in place. Use `-CopyArchives` only after confirming capacity when
+physical isolation is required.
 
 ## User-run block B: network-free preparation and training
 

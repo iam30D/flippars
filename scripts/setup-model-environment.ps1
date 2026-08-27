@@ -8,6 +8,7 @@ param(
   [string]$EnvironmentName = 'bootstrap-env',
   [ValidatePattern('^(auto|3\.(11|12|13|14))$')]
   [string]$PythonVersion = 'auto',
+  [string]$PythonExecutable,
   [string]$LockFile,
   [string]$Wheelhouse
 )
@@ -161,8 +162,40 @@ if (Test-Path -LiteralPath $environmentPath) {
 
 $selectedPythonVersion = $PythonVersion
 $pythonCommand = 'py'
+$explicitPythonPath = $null
+$explicitPythonCompatibility = $null
 Write-Host 'Detecting an installed Python runtime...'
-if ($PythonVersion -eq 'auto') {
+if ($PSBoundParameters.ContainsKey('PythonExecutable')) {
+  if ([string]::IsNullOrWhiteSpace($PythonExecutable) -or
+      (-not [System.IO.Path]::IsPathRooted($PythonExecutable))) {
+    throw 'PythonExecutable must be a nonempty absolute path.'
+  }
+  $explicitPythonPath = [System.IO.Path]::GetFullPath($PythonExecutable)
+  Assert-NoReparsePointAncestor $explicitPythonPath
+  if (-not (Test-Path -LiteralPath $explicitPythonPath -PathType Leaf)) {
+    throw "Explicit Python executable does not exist: $explicitPythonPath"
+  }
+  $pythonItem = Get-Item -LiteralPath $explicitPythonPath -Force
+  if (($pythonItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw "Explicit Python executable cannot be a reparse point: $explicitPythonPath"
+  }
+  $explicitPythonCompatibility = Get-PythonRuntimeCompatibility $explicitPythonPath
+  $explicitVersionMatch = [regex]::Match(
+    [string]$explicitPythonCompatibility.version,
+    '^3\.(11|12|13|14)\.\d+$'
+  )
+  if (($explicitPythonCompatibility.implementation -ne 'CPython') -or
+      (-not $explicitVersionMatch.Success)) {
+    throw 'PythonExecutable must identify a supported CPython 3.11-3.14 runtime.'
+  }
+  $detectedPythonVersion = "3.$($explicitVersionMatch.Groups[1].Value)"
+  if (($PythonVersion -ne 'auto') -and
+      ($PythonVersion -ne $detectedPythonVersion)) {
+    throw 'PythonExecutable runtime does not match PythonVersion.'
+  }
+  $selectedPythonVersion = $detectedPythonVersion
+  $pythonCommand = 'explicit'
+} elseif ($PythonVersion -eq 'auto') {
   foreach ($candidate in @('3.11', '3.12', '3.13', '3.14')) {
     try {
       & py "-$candidate" --version 2>$null | Out-Null
@@ -194,6 +227,14 @@ if (($Mode -eq 'Locked') -and
     (-not ([string]$semanticLock.python.version).StartsWith("$selectedPythonVersion."))) {
   throw 'Selected Python minor version does not match semantic lock evidence.'
 }
+if (($Mode -eq 'Locked') -and ($null -ne $explicitPythonCompatibility)) {
+  foreach ($field in @('implementation', 'version', 'cacheTag', 'platform', 'machine')) {
+    if ([string]$explicitPythonCompatibility.$field -ne
+        [string]$semanticLock.python.$field) {
+      throw "Explicit Python compatibility field '$field' does not match semantic lock evidence."
+    }
+  }
+}
 if ($selectedPythonVersion -ne '3.11') {
   Write-Warning "Python $selectedPythonVersion selected. Reproduce governed runs on the same Python minor version."
 }
@@ -212,7 +253,9 @@ foreach ($relativePath in @(
 }
 
 Write-Host "Creating isolated Python environment: $environmentPath"
-if ($pythonCommand -eq 'py') {
+if ($pythonCommand -eq 'explicit') {
+  & $explicitPythonPath -m venv $environmentPath
+} elseif ($pythonCommand -eq 'py') {
   & py "-$selectedPythonVersion" -m venv $environmentPath
 } else {
   & python -m venv $environmentPath
