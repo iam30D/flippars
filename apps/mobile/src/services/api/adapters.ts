@@ -1,5 +1,6 @@
 import {
   CandleStateSchema,
+  FIFTEEN_MINUTE_REVERSAL_START_SECONDS,
   MarketSnapshotSchema,
   SignalOutcomeSchema,
   SignalSchema,
@@ -177,14 +178,25 @@ export const adaptSignal = (rawValue: unknown): SignalView | null => {
       (predictedDirection === "lower" && observedPosition !== "above"))
   )
     return null;
+  const audit = contractSignal.audit;
   const issuedAtMs = Date.parse(contractSignal.issuedAt);
   const windowStartMs = Date.parse(contractSignal.windowStart);
-  if (kind === "fifteen_minute_reversal" && issuedAtMs < windowStartMs + 450_000)
-    return null;
-  if (kind === "five_minute_early_direction" && issuedAtMs > windowStartMs + 60_000)
+  if (kind === "fifteen_minute_reversal") {
+    const phaseStartSeconds =
+      audit.policyVersion === "precision-first/1"
+        ? 450
+        : audit.policyVersion === "precision-first/2"
+          ? FIFTEEN_MINUTE_REVERSAL_START_SECONDS
+          : null;
+    if (
+      phaseStartSeconds === null ||
+      issuedAtMs < windowStartMs + phaseStartSeconds * 1_000
+    )
+      return null;
+  }
+  if (kind === "five_minute_early_direction" && issuedAtMs >= windowStartMs + 60_000)
     return null;
   const model = contractSignal.model;
-  const audit = contractSignal.audit;
   const evidenceItems = contractSignal.evidence;
   const riskFlags = [
     ...arrayValue(signalRecord.riskFlags)

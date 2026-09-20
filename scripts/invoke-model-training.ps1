@@ -331,7 +331,7 @@ function Assert-ArchiveResumeSemanticCompatibility {
       ($inputs.schemas.datasetManifest -ne 'flippars.dataset-manifest/3') -or
       ($inputs.schemas.feature -ne 'binance-spot-signal-features/1') -or
       ($inputs.schemas.labelPolicy -ne 'binance-spot-trade-close-relation/1') -or
-      ($inputs.schemas.decisionPolicy -ne 'flippars-signal-candidate-sampling/1')) {
+      ($inputs.schemas.decisionPolicy -ne 'flippars-signal-candidate-sampling/2')) {
     Throw-ModelTrainingResumeReplacementRequired -Message (
       'Resume archive-preparation schemas differ from the current gap-aware policy. ' +
       'Preserve this run and use a new model version.'
@@ -340,7 +340,7 @@ function Assert-ArchiveResumeSemanticCompatibility {
   if ([string]$inputs.generator.pipelineSha256 -cnotmatch '^[a-f0-9]{64}$') {
     throw 'Resume archive-preparation generator has an invalid pipeline digest.'
   }
-  if ($inputs.generator.packageVersion -ne '0.3.0') {
+  if ($inputs.generator.packageVersion -ne '0.4.0') {
     Throw-ModelTrainingResumeReplacementRequired -Message (
       'Resume archive-preparation generator is incompatible with the current runner. ' +
       'Preserve this run and use a new model version.'

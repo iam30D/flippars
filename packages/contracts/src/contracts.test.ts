@@ -41,7 +41,7 @@ const fiveMinuteSchedule = {
 const fiveMinuteTarget = {
   kind: "BINANCE_SPOT_CANDLE_CLOSE_RELATION",
   targetVersion: BINANCE_SPOT_TARGET_VERSION,
-  decisionPolicyVersion: "flippars-signal-candidate-sampling/1",
+  decisionPolicyVersion: "flippars-signal-candidate-sampling/2",
   crossVenueGuardPolicyVersion: "btc-usd-cross-venue-health/1",
   signalType: "FIVE_MINUTE_REVERSAL",
   venue: "BINANCE",
@@ -156,14 +156,21 @@ describe("Binance research contracts", () => {
       }).success,
       false,
     );
+    assert.equal(
+      BinanceSpotForecastTargetSchema.safeParse({
+        ...fiveMinuteTarget,
+        decisionPolicyVersion: "flippars-signal-candidate-sampling/1",
+      }).success,
+      false,
+    );
   });
 
-  it("binds the 15-minute final-half schedule to the live 30-second lead floor", () => {
+  it("binds the 15-minute final-10-minute schedule to the live 30-second lead floor", () => {
     const schedule = {
       ...fiveMinuteSchedule,
-      firstDecisionOffsetSeconds: 450,
+      firstDecisionOffsetSeconds: 300,
       lastDecisionOffsetSeconds: 870,
-      phaseStartSeconds: 450,
+      phaseStartSeconds: 300,
       phaseEndExclusiveSeconds: 900,
       minimumLeadTimeSeconds: 30,
     };
@@ -174,6 +181,17 @@ describe("Binance research contracts", () => {
       candidateSchedule: schedule,
     };
     assert.equal(BinanceSpotForecastTargetSchema.safeParse(target).success, true);
+    assert.equal(
+      BinanceSpotForecastTargetSchema.safeParse({
+        ...target,
+        candidateSchedule: {
+          ...schedule,
+          firstDecisionOffsetSeconds: 450,
+          phaseStartSeconds: 450,
+        },
+      }).success,
+      false,
+    );
     assert.equal(
       BinanceSpotForecastTargetSchema.safeParse({
         ...target,
@@ -199,7 +217,7 @@ describe("Binance research contracts", () => {
       windowOpenTradeId: "100",
       lastIncludedTradeEventAt: "2026-01-01T00:00:14.900Z",
       lastIncludedTradeId: "200",
-      decisionPolicyVersion: "flippars-signal-candidate-sampling/1",
+      decisionPolicyVersion: "flippars-signal-candidate-sampling/2",
       decisionOffsetSeconds: 15,
       pointInTimeCutoff: "EVENT_TIME_LT_DECISION_AT",
       completedLookbackPolicy: "REQUIRE_13_CONTIGUOUS_COMPLETED_WINDOWS",
@@ -335,7 +353,7 @@ describe("Binance research contracts", () => {
         false,
       );
     }
-    for (const offset of [450, 870]) {
+    for (const offset of [300, 870]) {
       assert.equal(
         BinanceSpotFeatureVectorSchema.safeParse(
           scheduledVector("FIFTEEN_MINUTE_REVERSAL", 900, offset),
@@ -343,7 +361,7 @@ describe("Binance research contracts", () => {
         true,
       );
     }
-    for (const offset of [435, 885]) {
+    for (const offset of [285, 885]) {
       assert.equal(
         BinanceSpotFeatureVectorSchema.safeParse(
           scheduledVector("FIFTEEN_MINUTE_REVERSAL", 900, offset),

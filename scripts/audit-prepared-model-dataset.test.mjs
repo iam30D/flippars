@@ -18,7 +18,7 @@ function timestamp(windowIndex, offsetSeconds = 0) {
   ).toISOString();
 }
 
-function featureValues(offsetSeconds) {
+function featureValues(offsetSeconds, durationSeconds = 300) {
   const values = Object.fromEntries(
     BINANCE_SPOT_SIGNAL_FEATURE_NAMES.map((name) => [name, 0]),
   );
@@ -26,9 +26,34 @@ function featureValues(offsetSeconds) {
   values.previous_close_location = 0.5;
   values.current_buy_ratio = 0.5;
   values.current_close_location = 0.5;
-  values.elapsed_ratio = offsetSeconds / 300;
+  values.elapsed_ratio = offsetSeconds / durationSeconds;
   values.remaining_ratio = 1 - values.elapsed_ratio;
   return values;
+}
+
+function fifteenMinuteRow(offsetSeconds) {
+  const windowStart = new Date(SOURCE_START).toISOString();
+  const windowEnd = new Date(SOURCE_START + 900_000).toISOString();
+  const decisionAt = new Date(SOURCE_START + offsetSeconds * 1_000).toISOString();
+  const features = featureValues(offsetSeconds, 900);
+  features.current_return_from_open_bps = 10;
+  return {
+    schemaVersion: "flippars.training-dataset/3",
+    id: "BTCUSDT:" + windowStart + ":FIFTEEN_MINUTE_REVERSAL:" + offsetSeconds,
+    signalType: "FIFTEEN_MINUTE_REVERSAL",
+    decisionAt,
+    windowStart,
+    windowEnd,
+    durationSeconds: 900,
+    currentRelation: "ABOVE_OPEN",
+    candidateEligible: true,
+    features,
+    label: "ABOVE_OPEN",
+    deadbandBps: 5,
+    sourceIntegrityHealthy: true,
+    crossVenueGuardAvailability: "UNAVAILABLE",
+    productionEligible: false,
+  };
 }
 
 function row(windowIndex, offsetSeconds) {
@@ -131,6 +156,51 @@ test("streams a valid gap-abstaining corpus and rejects independent tampering", 
         preparedWindowCount: manifest.preparedWindowCount + 1,
       }),
       /gap-adjusted source coverage/u,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("audits every governed final-10-minute decision for a 15-minute reversal", async () => {
+  const root = mkdtempSync(join(tmpdir(), "flippars-prepared-audit-15m-"));
+  try {
+    const offsets = Array.from({ length: 39 }, (_, index) => 300 + index * 15);
+    const rows = offsets.map(fifteenMinuteRow);
+    const manifest = {
+      target: {
+        signalType: "FIFTEEN_MINUTE_REVERSAL",
+        durationSeconds: 900,
+        deadbandBps: 5,
+        candidateSchedule: {
+          firstDecisionOffsetSeconds: 300,
+          lastDecisionOffsetSeconds: 870,
+          cadenceSeconds: 15,
+        },
+      },
+      source: { startDateInclusive: null, endDateExclusive: null },
+      featureNames: [...BINANCE_SPOT_SIGNAL_FEATURE_NAMES],
+      gapCount: 0,
+      gapWindowStarts: [],
+      preparedWindowCount: 1,
+      preparedDecisionRowCount: rows.length,
+      startAt: rows[0].decisionAt,
+      endAt: rows.at(-1).windowEnd,
+      partitionWindowCounts: { modelFit: 0, calibration: 0, evaluation: 1 },
+    };
+    const validPath = join(root, "valid-15m.jsonl");
+    writeRows(validPath, rows);
+    const audit = await auditPreparedModelDataset(validPath, manifest);
+    assert.equal(audit.decisionRowCount, 39);
+
+    const invalidPath = join(root, "invalid-15m.jsonl");
+    writeRows(invalidPath, [
+      { ...rows[0], candidateEligible: false },
+      ...rows.slice(1),
+    ]);
+    await assert.rejects(
+      auditPreparedModelDataset(invalidPath, manifest),
+      /row eligibility is inconsistent/u,
     );
   } finally {
     rmSync(root, { recursive: true, force: true });

@@ -50,7 +50,7 @@ than inferred from signal type. The initial schedule samples every 15 seconds
 and selects at most the first qualified decision per window. Five-minute
 reversal offsets are `15..285` with a 15-second lead floor; early-direction
 offsets are `15..45` with a 15-second floor; fifteen-minute reversal offsets
-are `450..870` with the live policy's 30-second floor. Any schedule change
+are `300..870` with the live policy's 30-second floor. Any schedule change
 requires new versioned evidence and evaluation.
 
 ## Five-minute reversal
@@ -67,7 +67,7 @@ current price must still be on the original side at emission.
 
 ## Fifteen-minute reversal
 
-The same opposite-side definition applies, but eligibility begins at `T+7m30s`
+The same opposite-side definition applies, but eligibility begins at `T+5m00s`
 and ends at the configured minimum remaining lead time.
 
 ## Five-minute early direction

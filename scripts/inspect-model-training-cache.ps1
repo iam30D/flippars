@@ -279,7 +279,14 @@ foreach ($dateText in $requestedDates) {
       }
 
       if (Test-Path -LiteralPath $checksumPath -PathType Leaf) {
-        [System.IO.File]::Replace($temporaryChecksum, $checksumPath, $null, $true)
+        $replacementBackup = "$checksumPath.backup-$([guid]::NewGuid().ToString('N'))"
+        [System.IO.File]::Replace(
+          $temporaryChecksum,
+          $checksumPath,
+          $replacementBackup,
+          $true
+        )
+        Remove-Item -LiteralPath $replacementBackup -Force
       } else {
         [System.IO.File]::Move($temporaryChecksum, $checksumPath)
       }

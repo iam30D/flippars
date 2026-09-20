@@ -450,7 +450,7 @@ function buildBinanceCandidate() {
     target: {
       kind: "BINANCE_SPOT_CANDLE_CLOSE_RELATION",
       targetVersion: "binance-spot-trade-close-relation/1",
-      decisionPolicyVersion: "flippars-signal-candidate-sampling/1",
+      decisionPolicyVersion: "flippars-signal-candidate-sampling/2",
       crossVenueGuardPolicyVersion: "btc-usd-cross-venue-health/1",
       signalType: "FIVE_MINUTE_REVERSAL",
       venue: "BINANCE",

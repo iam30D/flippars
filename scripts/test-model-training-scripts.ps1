@@ -82,6 +82,15 @@ Assert-Throws { Assert-SafeModelVersion '..\artifact' } `
 Assert-Throws { Assert-ModelTrainingDateRange '2025-02-01' '2025-01-01' } `
   'Reversed training dates must be rejected.'
 [void](Assert-ModelTrainingDateRange '2025-01-01' '2025-01-02')
+$utcToday = [datetime]::UtcNow.Date
+$utcYesterday = $utcToday.AddDays(-1)
+$currentRange = Assert-ModelTrainingDateRange `
+  $utcYesterday.ToString('yyyy-MM-dd') `
+  $utcToday.ToString('yyyy-MM-dd')
+Assert-True `
+  (($currentRange.End.Kind -eq [System.DateTimeKind]::Utc) -and
+   ($currentRange.End -eq $utcToday)) `
+  'UTC date ranges must remain at UTC midnight in positive-offset local time zones.'
 
 $ps7StyleResponse = [pscustomobject]@{
   BaseResponse = [pscustomobject]@{
@@ -177,6 +186,45 @@ Assert-True ($inventoryText.Contains('$finalUri.AbsoluteUri -ne ([uri]$requested
   'Checksum retrieval must reject redirects away from the exact canonical URI.'
 Assert-True ($inventoryText.Contains('[System.IO.File]::Replace')) `
   'Existing checksum sidecars must be replaced atomically after validation.'
+Assert-True ($inventoryText.Contains('$replacementBackup')) `
+  'Windows PowerShell checksum replacement must use a non-null backup path.'
+Assert-True (-not $inventoryText.Contains('$temporaryChecksum, $checksumPath, $null, $true')) `
+  'Checksum replacement must not pass a null backup path to Windows PowerShell.'
+$atomicReplacementRoot = Join-Path `
+  ([System.IO.Path]::GetTempPath()) `
+  "Flippars-atomic-replace-test-$([guid]::NewGuid().ToString('N'))"
+try {
+  New-Item -ItemType Directory -Path $atomicReplacementRoot | Out-Null
+  $atomicSource = Join-Path $atomicReplacementRoot 'source.txt'
+  $atomicDestination = Join-Path $atomicReplacementRoot 'destination.txt'
+  $atomicBackup = Join-Path $atomicReplacementRoot 'backup.txt'
+  [System.IO.File]::WriteAllText($atomicSource, 'new')
+  [System.IO.File]::WriteAllText($atomicDestination, 'old')
+  [System.IO.File]::Replace($atomicSource, $atomicDestination, $atomicBackup, $true)
+  Assert-True `
+    ((Get-Content -LiteralPath $atomicDestination -Raw) -eq 'new') `
+    'Atomic checksum replacement must install the validated source bytes.'
+  Assert-True `
+    ((Get-Content -LiteralPath $atomicBackup -Raw) -eq 'old') `
+    'Atomic checksum replacement must retain recoverable prior bytes until cleanup.'
+} finally {
+  $temporaryBase = [System.IO.Path]::GetFullPath(
+    [System.IO.Path]::GetTempPath()
+  ).TrimEnd([char]92)
+  $resolvedAtomicReplacementRoot = [System.IO.Path]::GetFullPath(
+    $atomicReplacementRoot
+  )
+  $expectedAtomicPrefix = $temporaryBase + [char]92 + 'Flippars-atomic-replace-test-'
+  if (-not $resolvedAtomicReplacementRoot.StartsWith(
+      $expectedAtomicPrefix,
+      [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+    throw "Refusing unsafe atomic-replacement cleanup: $resolvedAtomicReplacementRoot"
+  }
+  if (Test-Path -LiteralPath $resolvedAtomicReplacementRoot) {
+    Remove-Item -LiteralPath $resolvedAtomicReplacementRoot -Recurse -Force
+  }
+}
 Assert-True ($inventoryText.Contains('OFFLINE_LOCAL_INVENTORY_ONLY')) `
   'Read-only inventory must explicitly disclaim fresh transport provenance.'
 foreach ($transportField in @(
@@ -882,10 +930,10 @@ try {
         datasetManifest = 'flippars.dataset-manifest/3'
         feature = 'binance-spot-signal-features/1'
         labelPolicy = 'binance-spot-trade-close-relation/1'
-        decisionPolicy = 'flippars-signal-candidate-sampling/1'
+        decisionPolicy = 'flippars-signal-candidate-sampling/2'
       }
       generator = [ordered]@{
-        packageVersion = '0.3.0'
+        packageVersion = '0.4.0'
         pipelineSha256 = (Get-FileHash -LiteralPath $semanticPipelinePath -Algorithm SHA256).Hash.ToLowerInvariant()
       }
     }
@@ -1087,10 +1135,10 @@ try {
         datasetManifest = 'flippars.dataset-manifest/3'
         feature = 'binance-spot-signal-features/1'
         labelPolicy = 'binance-spot-trade-close-relation/1'
-        decisionPolicy = 'flippars-signal-candidate-sampling/1'
+        decisionPolicy = 'flippars-signal-candidate-sampling/2'
       }
       generator = [ordered]@{
-        packageVersion = '0.3.0'
+        packageVersion = '0.4.0'
         pipelineSha256 = (
           Get-FileHash -LiteralPath $resumePreflightPipelinePath -Algorithm SHA256
         ).Hash.ToLowerInvariant()

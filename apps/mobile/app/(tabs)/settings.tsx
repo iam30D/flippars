@@ -103,7 +103,7 @@ export default function SettingsRoute(): React.JSX.Element {
               kind === "five_minute_reversal"
                 ? "Opposite-side close forecast before price crosses the five-minute open."
                 : kind === "fifteen_minute_reversal"
-                  ? "Only eligible during the final 7 minutes 30 seconds."
+                  ? "Only eligible during the final 10 minutes."
                   : "Closing direction forecast during the first 60 seconds."
             }
             value={preferences.enabledSignalKinds[kind]}

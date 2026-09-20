@@ -23,7 +23,7 @@ volume. No component may place trades or accept exchange credentials.
 
 1. `FIVE_MINUTE_REVERSAL` is evaluated while current price is still on the
    opposite side of the predicted close relative to the five-minute open.
-2. `FIFTEEN_MINUTE_REVERSAL` is only eligible in the final half of its interval.
+2. `FIFTEEN_MINUTE_REVERSAL` is only eligible in the final 10 minutes of its interval.
 3. `FIVE_MINUTE_EARLY_DIRECTION` is only eligible in the first 60 seconds.
 4. At most one signal of each type is emitted per aligned interval.
 5. Flat/deadband outcomes are not silently removed.

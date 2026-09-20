@@ -57,7 +57,7 @@ ARCHIVE_PREPARATION_PLAN_SCHEMA_VERSION = "flippars.archive-preparation-plan/1"
 ARCHIVE_PREPARATION_CHECKPOINT_SCHEMA_VERSION = "flippars.archive-preparation-checkpoint/2"
 FEATURE_SCHEMA_VERSION = "binance-spot-signal-features/1"
 LABEL_POLICY_VERSION = "binance-spot-trade-close-relation/1"
-DECISION_POLICY_VERSION = "flippars-signal-candidate-sampling/1"
+DECISION_POLICY_VERSION = "flippars-signal-candidate-sampling/2"
 CROSS_VENUE_GUARD_POLICY_VERSION = "btc-usd-cross-venue-health/1"
 PRE_EVALUATION_POLICY_SCHEMA_VERSION = "flippars.pre-evaluation-policy/2"
 PRE_EVALUATION_POLICY_CANONICALIZATION = (
@@ -66,6 +66,7 @@ PRE_EVALUATION_POLICY_CANONICALIZATION = (
 DEFAULT_DEADBAND_BPS = 5.0
 DEFAULT_DECISION_CADENCE_SECONDS = 15
 DEFAULT_MINIMUM_LEAD_TIME_SECONDS = 15
+FIFTEEN_MINUTE_REVERSAL_START_SECONDS = 300
 SIGNAL_MINIMUM_LEAD_TIME_SECONDS = {
     "FIVE_MINUTE_REVERSAL": 15,
     "FIFTEEN_MINUTE_REVERSAL": 30,
@@ -2993,7 +2994,7 @@ def decision_offsets(
     first = options.decision_cadence_seconds
     stop = duration_seconds - options.minimum_lead_time_seconds
     if signal_type == "FIFTEEN_MINUTE_REVERSAL":
-        first = 450
+        first = FIFTEEN_MINUTE_REVERSAL_START_SECONDS
     elif signal_type == "FIVE_MINUTE_EARLY_DIRECTION":
         stop = min(stop, 59)
     if stop < first:
@@ -3097,7 +3098,10 @@ def feature_map(
 def signal_candidate_eligible(signal_type: str, current_relation: str, elapsed_seconds: int) -> bool:
     if signal_type == "FIVE_MINUTE_EARLY_DIRECTION":
         return elapsed_seconds < 60
-    if signal_type == "FIFTEEN_MINUTE_REVERSAL" and elapsed_seconds < 450:
+    if (
+        signal_type == "FIFTEEN_MINUTE_REVERSAL"
+        and elapsed_seconds < FIFTEEN_MINUTE_REVERSAL_START_SECONDS
+    ):
         return False
     return current_relation != "AT_OPEN"
 
@@ -5363,9 +5367,17 @@ def fit_ood_envelope(
 
 def target_contract(signal_type: str, deadband_bps: float) -> dict[str, object]:
     duration_seconds = SIGNAL_DURATION_SECONDS[signal_type]
-    phase_start = 450 if signal_type == "FIFTEEN_MINUTE_REVERSAL" else 0
+    phase_start = (
+        FIFTEEN_MINUTE_REVERSAL_START_SECONDS
+        if signal_type == "FIFTEEN_MINUTE_REVERSAL"
+        else 0
+    )
     phase_end = 60 if signal_type == "FIVE_MINUTE_EARLY_DIRECTION" else duration_seconds
-    first_offset = 450 if signal_type == "FIFTEEN_MINUTE_REVERSAL" else DEFAULT_DECISION_CADENCE_SECONDS
+    first_offset = (
+        FIFTEEN_MINUTE_REVERSAL_START_SECONDS
+        if signal_type == "FIFTEEN_MINUTE_REVERSAL"
+        else DEFAULT_DECISION_CADENCE_SECONDS
+    )
     return {
         "kind": "BINANCE_SPOT_CANDLE_CLOSE_RELATION",
         "targetVersion": LABEL_POLICY_VERSION,
@@ -5411,7 +5423,8 @@ def target_contract_for_options(options: DatasetOptions) -> dict[str, object]:
     schedule["cadenceSeconds"] = options.decision_cadence_seconds
     schedule["minimumLeadTimeSeconds"] = options.minimum_lead_time_seconds
     schedule["firstDecisionOffsetSeconds"] = (
-        450 if options.signal_type == "FIFTEEN_MINUTE_REVERSAL"
+        FIFTEEN_MINUTE_REVERSAL_START_SECONDS
+        if options.signal_type == "FIFTEEN_MINUTE_REVERSAL"
         else options.decision_cadence_seconds
     )
     schedule["lastDecisionOffsetSeconds"] = (
@@ -5771,7 +5784,7 @@ def validate_dataset_manifest(value: object) -> dict[str, object]:
         raise ValueError("Dataset generator metadata has an unexpected schema")
     if any(not isinstance(generator[name], str) or not generator[name] for name in generator):
         raise ValueError("Dataset generator metadata must contain nonempty strings")
-    if generator["packageVersion"] != "0.3.0":
+    if generator["packageVersion"] != "0.4.0":
         raise ValueError("Dataset generator package version is unsupported")
 
     count_names = (
@@ -6561,7 +6574,7 @@ def runtime_metadata() -> dict[str, object]:
         "pythonVersion": platform.python_version(),
         "implementation": platform.python_implementation(),
         "platform": platform.platform(),
-        "packageVersion": "0.3.0",
+        "packageVersion": "0.4.0",
     }
 
 

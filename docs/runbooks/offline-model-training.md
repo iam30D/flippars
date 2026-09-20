@@ -15,7 +15,7 @@ under [data governance](../data-governance.md) before production use.
 ## Predeclared corpus
 
 The operator blocks use the end-exclusive window `2022-01-01` through
-`2026-08-02` (1,674 daily archives). This deliberately emphasizes the market
+`2026-09-19` (1,722 daily archives). This deliberately emphasizes the market
 microstructure relevant to the current app while retaining several bullish,
 bearish, volatile, and quieter regimes. It is a baseline decision, not proof
 that this is the statistically optimal window. The chronological 60/20/20
@@ -126,7 +126,7 @@ if ($null -ne $smokeFailure) { throw $smokeFailure }
 try {
   Write-Host "Running bounded real-archive gap diagnostic..." -ForegroundColor Cyan
   $datasetSnapshotRoot =
-    "C:\Users\HP\Flippars-ml\datasets\BTCUSDT-2022-01-01--2026-08-02"
+    "C:\Users\HP\Flippars-ml\datasets\BTCUSDT-2022-01-01--2026-09-19"
   $sourceArchiveRoot = Join-Path $datasetSnapshotRoot "raw\archives"
   $acquisitionManifestPath = Join-Path $datasetSnapshotRoot `
     "evidence\acquisition-manifest.json"
@@ -364,8 +364,8 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 . .\scripts\model-training-guardrails.ps1
 
 $trainingRoot = "C:\Users\HP\Flippars-ml"
-$bootstrapEnvironment = "bootstrap-env-v5"
-$finalEnvironment = "final-env-v5"
+$bootstrapEnvironment = "bootstrap-env-v6"
+$finalEnvironment = "final-env-v6"
 $pythonExecutable = "C:\Users\HP\AppData\Local\Programs\Python\Python311\python.exe"
 $dependencyProfile = "GovernedBaseline"
 $platformKey = "cp311-win_amd64"
@@ -374,8 +374,8 @@ $semanticLockFile = "$lockFile.manifest.json"
 $wheelhouse = Join-Path $trainingRoot "wheelhouse\governed-baseline\$platformKey"
 $archiveCache = Join-Path $trainingRoot "data\raw\archives"
 $start = "2022-01-01"
-$end = "2026-08-02"
-$maxFiles = 1700
+$end = "2026-09-19"
+$maxFiles = 1750
 $datasetRoot = Join-Path $trainingRoot "datasets\BTCUSDT-$start--$end"
 $environmentManifest = Join-Path $trainingRoot "$finalEnvironment\environment-manifest.json"
 $acquisitionManifest = Join-Path $datasetRoot "evidence\acquisition-manifest.json"
@@ -463,8 +463,8 @@ if (Test-Path -LiteralPath $datasetRoot -PathType Container) {
       ($acquisition.source.dataKind -ne "DAILY_TRADES") -or
       ($acquisition.window.startInclusive -ne $start) -or
       ($acquisition.window.endExclusive -ne $end) -or
-      ([int]$acquisition.window.dayCount -ne 1674) -or
-      (@($acquisition.archives).Count -ne 1674) -or
+      ([int]$acquisition.window.dayCount -ne 1722) -or
+      (@($acquisition.archives).Count -ne 1722) -or
       ((ConvertTo-NormalizedFullPath ([string]$acquisition.archiveRoot)) -ne
        (ConvertTo-NormalizedFullPath (Join-Path $datasetRoot "raw\archives"))) -or
       ((ConvertTo-NormalizedFullPath ([string]$acquisition.isolatedIntegrity.Path)) -ne
@@ -542,9 +542,9 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 $trainingRoot = "C:\Users\HP\Flippars-ml"
 $repositoryRoot = (Resolve-Path -LiteralPath ".").Path
 $trainingRoot = Assert-ExternalTrainingRoot $trainingRoot $repositoryRoot
-$finalEnvironment = "final-env-v5"
+$finalEnvironment = "final-env-v6"
 $start = "2022-01-01"
-$end = "2026-08-02"
+$end = "2026-09-19"
 $confidenceThreshold = 0.75
 $validityDays = 120
 
@@ -566,15 +566,15 @@ if ($LASTEXITCODE -ne 0) { throw "Model-artifact build failed with exit code $LA
 $runs = @(
   [ordered]@{
     SignalType = "FIVE_MINUTE_EARLY_DIRECTION"
-    Version = "btc-spot-early-20260826.1"
+    Version = "btc-spot-early-20260920.1"
   },
   [ordered]@{
     SignalType = "FIVE_MINUTE_REVERSAL"
-    Version = "btc-spot-5m-reversal-20260826.1"
+    Version = "btc-spot-5m-reversal-20260920.1"
   },
   [ordered]@{
     SignalType = "FIFTEEN_MINUTE_REVERSAL"
-    Version = "btc-spot-15m-reversal-20260826.1"
+    Version = "btc-spot-15m-reversal-20260920.1"
   }
 )
 
@@ -877,7 +877,7 @@ for that duration.
 
 The existing `C:\Users\HP\Flippars-ml\.venv` is an older Python 3.13 exploration
 environment and is not accepted by `FrozenDraft`. After block A succeeds and
-the schema-2 `final-env-v5` evidence has been inspected, it may be removed in a
+the schema-2 `final-env-v6` evidence has been inspected, it may be removed in a
 separate explicit User-run cleanup operation to recover space. Never remove the
 archive cache, isolated dataset, wheelhouse, semantic lock, evidence, or draft
 artifacts as cleanup.

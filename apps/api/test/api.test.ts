@@ -23,7 +23,7 @@ import { InMemoryRepository } from "../src/repositories/memory.js";
 import { OutcomeEvaluator } from "../src/signals/outcomes.js";
 import { FakeModelRuntime } from "../src/signals/runtime.js";
 import { SafetyController } from "../src/signals/safety.js";
-import { SignalWorker } from "../src/signals/worker.js";
+import { SignalWorker, signalPhaseAbstentionReason } from "../src/signals/worker.js";
 import { presentMarketSnapshot } from "../src/transport/presenters.js";
 
 const apps: FastifyInstance[] = [];
@@ -303,6 +303,22 @@ void describe("anonymous guest privacy", () => {
 });
 
 void describe("signal safety and idempotency", () => {
+  void test("opens the 15-minute reversal phase at exactly T+300s", () => {
+    assert.equal(
+      signalPhaseAbstentionReason("fifteen_minute_reversal", 299_999),
+      "outside_final_10m",
+    );
+    assert.equal(signalPhaseAbstentionReason("fifteen_minute_reversal", 300_000), null);
+    assert.equal(
+      signalPhaseAbstentionReason("five_minute_early_direction", 59_999),
+      null,
+    );
+    assert.equal(
+      signalPhaseAbstentionReason("five_minute_early_direction", 60_000),
+      "outside_first_60s",
+    );
+  });
+
   void test("unhealthy/stale market state suppresses otherwise high-confidence signal", async () => {
     const repository = new InMemoryRepository();
     repository.models.set("five_minute_reversal", {

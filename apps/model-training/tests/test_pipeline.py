@@ -53,6 +53,7 @@ from flippars_model_training.pipeline import (
     pre_evaluation_sampling_contract,
     replay_policy,
     select_offline_archives,
+    signal_candidate_eligible,
     softmax,
     stream_archive_candles,
     time_block_metric_intervals,
@@ -1431,7 +1432,11 @@ class SignalFeatureTests(unittest.TestCase):
         five = list(decision_offsets("FIVE_MINUTE_REVERSAL", 300, options("FIVE_MINUTE_REVERSAL")))
         self.assertEqual((five[0], five[-1]), (15, 285))
         fifteen = list(decision_offsets("FIFTEEN_MINUTE_REVERSAL", 900, options("FIFTEEN_MINUTE_REVERSAL")))
-        self.assertEqual((fifteen[0], fifteen[-1]), (450, 870))
+        self.assertEqual((fifteen[0], fifteen[-1]), (300, 870))
+        self.assertEqual(len(fifteen), 39)
+        self.assertFalse(signal_candidate_eligible("FIFTEEN_MINUTE_REVERSAL", "ABOVE_OPEN", 299))
+        self.assertTrue(signal_candidate_eligible("FIFTEEN_MINUTE_REVERSAL", "ABOVE_OPEN", 300))
+        self.assertFalse(signal_candidate_eligible("FIFTEEN_MINUTE_REVERSAL", "AT_OPEN", 300))
 
     def test_signal_duration_and_lead_are_bound(self) -> None:
         bad = DatasetOptions("FIFTEEN_MINUTE_REVERSAL", 5.0, 5, 15, 30)

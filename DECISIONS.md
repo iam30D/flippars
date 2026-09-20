@@ -62,3 +62,18 @@ validated, approved, shadowed, and canaried artifacts can become champions.
 
 **Why:** Uncontrolled online learning risks poisoning, drift, leakage, and
 unreviewed behavioral changes.
+
+## ADR-008 — Version the expanded fifteen-minute reversal phase
+
+**Decision:** Begin `FIFTEEN_MINUTE_REVERSAL` eligibility at `T+300s`, retain
+the 30-second minimum lead and full-candle close outcome, and bind all newly
+generated candidates to sampling-policy v2 and generator v0.4.0.
+
+**Why:** The final-10-minute definition creates 39 governed decision points per
+interval instead of 29. Versioning prevents older `T+450s` evidence from being
+silently resumed or presented as compatible, while preserving old artifacts as
+immutable historical records.
+
+**Alternatives:** Reinterpreting “last 10 minutes” as a shorter outcome horizon
+would change the product target and was rejected. Overwriting v1 datasets or
+artifacts was rejected because it would destroy lineage.

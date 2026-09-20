@@ -1,7 +1,9 @@
 import {
+  FIFTEEN_MINUTE_REVERSAL_START_SECONDS,
   SignalSchema,
   type AuditMetadata,
   type CandleState,
+  type MarketSnapshot,
   type PredictedCloseRelation,
   type Signal,
   type SignalType,
@@ -17,7 +19,6 @@ import {
   type ManipulationRiskMetrics,
 } from "./risk.js";
 import { isInsideWindow, toEpochMilliseconds } from "./windows.js";
-import type { MarketSnapshot } from "@flippars/contracts";
 
 export type AbstentionReason =
   | "MARKET_UNAVAILABLE"
@@ -46,7 +47,7 @@ export interface SignalPolicy {
   readonly allowedFutureClockSkewMs: number;
   readonly forecastMaxAgeMs: number;
   readonly deadbandBps: number;
-  readonly fifteenMinuteFinalWindowSeconds: number;
+  readonly fifteenMinuteReversalStartSeconds: number;
   readonly fiveMinuteEarlyWindowSeconds: number;
   readonly anomalySuppressionThreshold: number;
   readonly allowUnapprovedArtifactsOutsideLive: boolean;
@@ -61,7 +62,7 @@ export interface SignalPolicyOverrides {
   readonly allowedFutureClockSkewMs?: number;
   readonly forecastMaxAgeMs?: number;
   readonly deadbandBps?: number;
-  readonly fifteenMinuteFinalWindowSeconds?: number;
+  readonly fifteenMinuteReversalStartSeconds?: number;
   readonly fiveMinuteEarlyWindowSeconds?: number;
   readonly anomalySuppressionThreshold?: number;
   readonly allowUnapprovedArtifactsOutsideLive?: boolean;
@@ -84,12 +85,12 @@ export const DEFAULT_SIGNAL_POLICY: Readonly<SignalPolicy> = {
   allowedFutureClockSkewMs: 1_000,
   forecastMaxAgeMs: 30_000,
   deadbandBps: 1,
-  fifteenMinuteFinalWindowSeconds: 450,
+  fifteenMinuteReversalStartSeconds: FIFTEEN_MINUTE_REVERSAL_START_SECONDS,
   fiveMinuteEarlyWindowSeconds: 60,
   anomalySuppressionThreshold: DEFAULT_RISK_CONFIG.suppressionThreshold,
   allowUnapprovedArtifactsOutsideLive: true,
   engineVersion: "signal-core/0.1.0",
-  policyVersion: "precision-first/1",
+  policyVersion: "precision-first/2",
 };
 
 export interface SignalEvaluationInput {
@@ -440,11 +441,11 @@ export class SignalEngine {
 
     if (
       input.forecast.signalType === "FIFTEEN_MINUTE_REVERSAL" &&
-      elapsedSeconds < this.policy.fifteenMinuteFinalWindowSeconds
+      elapsedSeconds < this.policy.fifteenMinuteReversalStartSeconds
     ) {
       return abstain(
         "NOT_IN_SIGNAL_PHASE",
-        "The 15-minute reversal is limited to the final 7 minutes 30 seconds",
+        "The 15-minute reversal is limited to the final 10 minutes",
       );
     }
     if (
@@ -556,10 +557,11 @@ export class SignalEngine {
       }
     }
     if (
-      this.policy.fifteenMinuteFinalWindowSeconds !== 450 ||
+      this.policy.fifteenMinuteReversalStartSeconds !==
+        FIFTEEN_MINUTE_REVERSAL_START_SECONDS ||
       this.policy.fiveMinuteEarlyWindowSeconds !== 60
     ) {
-      throw new RangeError("Approved signal windows are fixed at 450 and 60 seconds");
+      throw new RangeError("Approved signal windows are fixed at 300 and 60 seconds");
     }
     if (!Number.isFinite(this.policy.deadbandBps) || this.policy.deadbandBps < 0) {
       throw new RangeError("deadbandBps must be non-negative");

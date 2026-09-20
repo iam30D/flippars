@@ -477,7 +477,8 @@ function Assert-ModelTrainingDateRange {
 
   $format = 'yyyy-MM-dd'
   $culture = [System.Globalization.CultureInfo]::InvariantCulture
-  $styles = [System.Globalization.DateTimeStyles]::AssumeUniversal
+  $styles = [System.Globalization.DateTimeStyles]::AssumeUniversal -bor `
+    [System.Globalization.DateTimeStyles]::AdjustToUniversal
   $startDate = [datetime]::MinValue
   $endDate = [datetime]::MinValue
   if (-not [datetime]::TryParseExact($Start, $format, $culture, $styles, [ref]$startDate)) {

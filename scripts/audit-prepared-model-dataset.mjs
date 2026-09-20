@@ -221,7 +221,7 @@ function expectedEligibility(signalType, relation, offset) {
   if (signalType === "FIVE_MINUTE_EARLY_DIRECTION") {
     return offset < 60;
   }
-  if (signalType === "FIFTEEN_MINUTE_REVERSAL" && offset < 450) {
+  if (signalType === "FIFTEEN_MINUTE_REVERSAL" && offset < 300) {
     return false;
   }
   return relation !== "AT_OPEN";

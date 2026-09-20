@@ -16,7 +16,7 @@ The platform supports three independently governed targets:
 1. **Five-minute reversal** — while the current composite remains above the
    interval open, forecast a close below the open, or the exact inverse.
 2. **Fifteen-minute reversal** — the same opposite-side close target, eligible
-   only in the final 7 minutes 30 seconds of the interval.
+   only in the final 10 minutes of the interval.
 3. **Five-minute early direction** — during the first 60 seconds, forecast the
    final side of the five-minute close.
 

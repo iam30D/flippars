@@ -78,6 +78,9 @@ Feature rows use 24 ordered finite features, 13 contiguous completed lookback
 windows, and only trades with `eventTime < decisionAt`. Five-minute reversal,
 five-minute early-direction, and fifteen-minute reversal use their exact
 governed 15-second schedules and retain flat/deadband outcomes.
+Sampling-policy v2 schedules fifteen-minute reversal decisions from `T+300s`
+through `T+870s` inclusive (39 decisions); v1 artifacts remain historical and
+cannot be resumed under this policy.
 Deadband comparisons use decimal arithmetic, so equality at exactly plus or
 minus five basis points remains `AT_OPEN`.
 

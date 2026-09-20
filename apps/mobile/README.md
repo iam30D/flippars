@@ -5,7 +5,7 @@ Guest-first Expo SDK 56 iPhone client for informational BTC/USD signals. The app
 ## Product behavior
 
 - Shows the quality-screened Coinbase/Kraken/Binance BTC/USD composite, venue/data health, UTC-aligned five- and fifteen-minute openings, current deltas, and close countdowns.
-- Gives a permanent dashboard slot to all three approved signals: five-minute reversal, final-7:30 fifteen-minute reversal, and first-60-seconds five-minute closing direction.
+- Gives a permanent dashboard slot to all three approved signals: five-minute reversal, final-10-minute fifteen-minute reversal, and first-60-seconds five-minute closing direction.
 - Treats “No qualified signal” as an explicit model abstention, not an error or a hidden prediction.
 - Displays calibrated probability, issue/expiry, direction, model/calibration versions, observations, model/policy factors, verified reported context, risks, audit identifiers, and outcomes.
 - Keeps correct, incorrect, flat, void, and pending results together in complete cursor-paginated history.

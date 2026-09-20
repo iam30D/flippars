@@ -8,7 +8,8 @@ export const BINANCE_SPOT_TARGET_VERSION =
 export const BINANCE_SPOT_FEATURE_SCHEMA_VERSION =
   "binance-spot-signal-features/1" as const;
 export const SIGNAL_CANDIDATE_SAMPLING_POLICY_VERSION =
-  "flippars-signal-candidate-sampling/1" as const;
+  "flippars-signal-candidate-sampling/2" as const;
+export const FIFTEEN_MINUTE_REVERSAL_START_SECONDS = 300 as const;
 export const CROSS_VENUE_GUARD_POLICY_VERSION = "btc-usd-cross-venue-health/1" as const;
 export const PRE_EVALUATION_POLICY_SCHEMA_VERSION =
   "flippars.pre-evaluation-policy/2" as const;
@@ -146,11 +147,15 @@ export const BinanceSpotForecastTargetSchema = z
     }
     const schedule = target.candidateSchedule;
     const expectedPhaseStart =
-      target.signalType === "FIFTEEN_MINUTE_REVERSAL" ? 450 : 0;
+      target.signalType === "FIFTEEN_MINUTE_REVERSAL"
+        ? FIFTEEN_MINUTE_REVERSAL_START_SECONDS
+        : 0;
     const expectedPhaseEnd =
       target.signalType === "FIVE_MINUTE_EARLY_DIRECTION" ? 60 : expectedDuration;
     const expectedFirstDecisionOffset =
-      target.signalType === "FIFTEEN_MINUTE_REVERSAL" ? 450 : 15;
+      target.signalType === "FIFTEEN_MINUTE_REVERSAL"
+        ? FIFTEEN_MINUTE_REVERSAL_START_SECONDS
+        : 15;
     const expectedLastDecisionOffset =
       target.signalType === "FIFTEEN_MINUTE_REVERSAL"
         ? 870
@@ -171,7 +176,7 @@ export const BinanceSpotForecastTargetSchema = z
         code: z.ZodIssueCode.custom,
         path: ["candidateSchedule"],
         message:
-          `Policy V1 requires phase [${expectedPhaseStart}, ${expectedPhaseEnd}), ` +
+          `Policy V2 requires phase [${expectedPhaseStart}, ${expectedPhaseEnd}), ` +
           `offsets ${expectedFirstDecisionOffset}..${expectedLastDecisionOffset}, 15-second cadence, and ` +
           `${expectedMinimumLead}-second minimum lead`,
       });
@@ -237,11 +242,15 @@ export const BinanceSpotRuntimeCompatibilitySchema = z
     }
     const schedule = runtime.candidateSchedule;
     const expectedPhaseStart =
-      runtime.signalType === "FIFTEEN_MINUTE_REVERSAL" ? 450 : 0;
+      runtime.signalType === "FIFTEEN_MINUTE_REVERSAL"
+        ? FIFTEEN_MINUTE_REVERSAL_START_SECONDS
+        : 0;
     const expectedPhaseEnd =
       runtime.signalType === "FIVE_MINUTE_EARLY_DIRECTION" ? 60 : expectedDuration;
     const expectedFirstDecisionOffset =
-      runtime.signalType === "FIFTEEN_MINUTE_REVERSAL" ? 450 : 15;
+      runtime.signalType === "FIFTEEN_MINUTE_REVERSAL"
+        ? FIFTEEN_MINUTE_REVERSAL_START_SECONDS
+        : 15;
     const expectedLastDecisionOffset =
       runtime.signalType === "FIFTEEN_MINUTE_REVERSAL"
         ? 870
@@ -262,7 +271,7 @@ export const BinanceSpotRuntimeCompatibilitySchema = z
         code: z.ZodIssueCode.custom,
         path: ["candidateSchedule"],
         message:
-          `Policy V1 requires phase [${expectedPhaseStart}, ${expectedPhaseEnd}), ` +
+          `Policy V2 requires phase [${expectedPhaseStart}, ${expectedPhaseEnd}), ` +
           `offsets ${expectedFirstDecisionOffset}..${expectedLastDecisionOffset}, 15-second cadence, and ` +
           `${expectedMinimumLead}-second minimum lead`,
       });
@@ -424,7 +433,10 @@ export const BinanceSpotFeatureVectorSchema = z
     const windowAligned =
       windowStart / durationMs === Math.trunc(windowStart / durationMs);
     if (!windowAligned) context.addIssue(unalignedWindowIssue);
-    const offsetStart = vector.signalType === "FIFTEEN_MINUTE_REVERSAL" ? 450 : 15;
+    const offsetStart =
+      vector.signalType === "FIFTEEN_MINUTE_REVERSAL"
+        ? FIFTEEN_MINUTE_REVERSAL_START_SECONDS
+        : 15;
     const offsetEnd =
       vector.signalType === "FIFTEEN_MINUTE_REVERSAL"
         ? 870

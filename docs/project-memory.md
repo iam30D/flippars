@@ -5,7 +5,7 @@
 - Informational Bitcoin signals only; no trading or exchange-account access.
 - Coinbase, Kraken, and Binance contribute to the reference market.
 - Five-minute reversal while price remains on the opposite side of the open.
-- Fifteen-minute reversal only in the interval's final 7 minutes 30 seconds.
+- Fifteen-minute reversal only in the interval's final 10 minutes.
 - Five-minute closing direction may trigger during the first 60 seconds.
 - One alert per signal type per interval; precision over alert volume.
 - Full guest access first; subscriptions and optional accounts later.
