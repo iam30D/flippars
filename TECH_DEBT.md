@@ -4,6 +4,44 @@ Nothing in this file authorizes bypassing a release gate.
 
 ## External dependencies
 
+- Independently review revision-three guard-source isolation and per-decision
+  guard attachment before any production serving. Retired/missing guard data
+  remains unavailable; degraded research completion is not healthy quorum or
+  model approval. Guard reconnection/healthy resumption remains deferred.
+- Investigate the fresh smoke's overlapping 20–21-second venue receipt gaps
+  with the separately bound runtime witness and per-instrument quality audit.
+  The owner noticed no sleep/network changes. Do not infer root cause, absolute
+  clock health, or acceptable staleness from this smoke; keep model emission
+  disabled and review measured input availability before the long warm-up run.
+  The subsequent observed smoke did not reproduce the 20-second incident:
+  maximum event-loop sample 354 ms and Binance event-to-receipt difference
+  417 ms. Its cause remains unknown; a long research warm-up may proceed,
+  while per-instrument and absolute clock health remain unapproved.
+- Complete the trade/guard recorder's per-instrument health assessment,
+  reviewed long-session rotation/continuity and retention,
+  independent review of full-population research replay and immutable reports,
+  durable prospective model/outcome recording, and broader independent
+  reference coverage, isolated
+  shadow ledger, full-population replay, and successor serving contract in the
+  order documented in `docs/model-recovery-research.md`. The diagnostic
+  evaluation reader and initial isolated market recorder are not serving
+  providers or approval mechanisms. See `docs/runbooks/research-market-capture.md`.
+- Preserve exact collector source revisions and add an independently reviewed
+  archival/reader compatibility workflow before changing bound collector modules.
+  Revision-one and separate revision-two readers require exact current hashes
+  for their own module sets; the original three files remain unchanged. Keep
+  their deliberate implementation duplication until a reviewed migration can
+  preserve historical evidence without weakening source binding.
+- Establish measured clock-health evidence after the owner's successful host
+  resync before prospective model use. A short post-resync public NTP probe
+  still estimated approximately 265–269 ms offsets, without establishing exact
+  clock error. The first smoke
+  contains negative event/receive differences beyond timestamp quantization;
+  source integrity verification does not make those timestamps healthy. The
+  new bounded numerical feature audit remains research-only and must not
+  substitute for the guarded serving path. Rolling feature state is now
+  implemented and tested; its file adapter and outcome ledger remain pending.
+
 - Select and license production historical Level-2, derivatives, on-chain, and
   news datasets.
 - Complete the prospective shadow period for each signal type; no production

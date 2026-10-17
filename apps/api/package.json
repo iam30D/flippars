@@ -15,7 +15,7 @@
     "migrate:prod": "node dist/src/db/migrate.js",
     "retention": "tsx src/db/retention-cli.ts",
     "retention:prod": "node dist/src/db/retention-cli.js",
-    "test": "node --import tsx --test test/api.test.ts test/config.test.ts test/retention.test.ts",
+    "test": "node --import tsx --test test/api.test.ts test/config.test.ts test/retention.test.ts test/capture.test.ts test/capture-verifier.test.ts test/trade-features.test.ts test/trade-feature-stream.test.ts test/bounded-jsonl.test.ts test/capture-replay.test.ts test/population-replay.test.ts test/capture-clock.test.ts test/capture-long.test.ts test/capture-quality.test.ts test/runtime-witness.test.ts test/capture-isolated.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
