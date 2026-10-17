@@ -10,7 +10,7 @@
     "web": "expo start --web",
     "build": "expo export --platform ios --output-dir dist",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test src/domain/time.test.ts src/domain/freshness.test.ts src/domain/format.test.ts src/services/notifications/eligibility.test.ts src/services/api/recovery.test.ts"
+    "test": "tsx --test src/domain/time.test.ts src/domain/freshness.test.ts src/domain/format.test.ts src/services/guest-session.test.ts src/services/notifications/eligibility.test.ts src/services/notifications/registration.test.ts src/services/api/adapters.test.ts src/services/api/client.test.ts src/services/api/recovery.test.ts"
   },
   "dependencies": {
     "@flippars/contracts": "0.1.0",
@@ -18,6 +18,7 @@
     "expo": "~56.0.12",
     "expo-constants": "~56.0.22",
     "expo-crypto": "~56.0.4",
+    "expo-dev-client": "56.0.24",
     "expo-device": "~56.0.4",
     "expo-linking": "~56.0.16",
     "expo-notifications": "~56.0.22",

@@ -5,11 +5,11 @@ Guest-first Expo SDK 56 iPhone client for informational BTC/USD signals. The app
 ## Product behavior
 
 - Shows the quality-screened Coinbase/Kraken/Binance BTC/USD composite, venue/data health, UTC-aligned five- and fifteen-minute openings, current deltas, and close countdowns.
-- Gives a permanent dashboard slot to all three approved signals: five-minute reversal, final-7:30 fifteen-minute reversal, and first-60-seconds five-minute closing direction.
+- Gives a permanent dashboard slot to all three approved signals: five-minute reversal, final-10-minute fifteen-minute reversal, and first-60-seconds five-minute closing direction.
 - Treats “No qualified signal” as an explicit model abstention, not an error or a hidden prediction.
 - Displays calibrated probability, issue/expiry, direction, model/calibration versions, observations, model/policy factors, verified reported context, risks, audit identifiers, and outcomes.
 - Keeps correct, incorrect, flat, void, and pending results together in complete cursor-paginated history.
-- Provides guest access without login or subscription. A random installation UUID is stored in SecureStore; settings and cached public state use namespaced AsyncStorage keys.
+- Provides guest access without login or subscription. A random installation UUID and independent 256-bit mutation credential are stored in SecureStore; settings and cached public state use namespaced AsyncStorage keys.
 - Requests iOS notification permission only after the onboarding value/uncertainty explanation and a direct user tap.
 - Discards stale foreground notifications and stale notification deep links.
 - Supports system light/dark appearance, Dynamic Type, VoiceOver labels/hints, non-color status symbols, 44-point controls, and reduced-motion system settings (the current UI uses no nonessential motion).
@@ -59,13 +59,15 @@ The client uses `EXPO_PUBLIC_API_URL` for:
 - `DELETE /v1/devices/:installationId`
 - `WS /v1/stream` (public market/signal stream; the guest identifier is not placed in the URL)
 
+Only the three guest mutation requests carry `X-Flippars-Installation-ID` and `X-Flippars-Guest-Credential`. Public REST reads and the WebSocket connection carry neither value. Reset queues the old credential in Keychain-backed deletion storage before rotating the active guest session, and later live launches retry any deletion that did not reach the API.
+
 Canonical types and runtime schemas come from `@flippars/contracts`. Wire enums remain uppercase and monetary values remain decimal strings until `services/api/adapters.ts`, the validated display boundary. The stream rejects malformed schema versions/sequences, ignores duplicates, detects gaps, recovers the market snapshot, current aligned candles, and history over REST, applies the held event, and reconnects with bounded exponential jitter. A fresh REST recovery also runs on every successful stream reconnect and app foreground transition.
 
 History items are `{ signal, outcome }`, where outcome begins `PENDING`; outcome stream events update the matching immutable signal record. Cursor pagination is never filtered by outcome.
 
 ## Notifications
 
-`expo-notifications` requests permission and obtains the native iOS APNs device token; the API sends directly through APNs. The EAS project must be associated with valid APNs credentials, and the server device association remains anonymous. Signal payload data must include:
+`expo-notifications` requests permission and obtains the native iOS APNs device token only after an explicit in-app alert opt-in; an existing OS grant alone never uploads or re-associates the token. The API sends directly through APNs. The EAS project must be associated with valid APNs credentials, and the server device association remains anonymous. Signal payload data must include:
 
 ```json
 {

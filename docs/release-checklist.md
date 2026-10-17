@@ -13,6 +13,10 @@
 
 - [ ] Point-in-time replay and leakage review pass.
 - [ ] Venue gaps, stale feeds, stablecoin deviation, and quorum fixtures abstain.
+- [ ] Checksum-verified internal no-trade fixtures retain exact gap lineage,
+      synthesize nothing, and omit gap and 13-lookback-dependent examples.
+- [ ] Missing-ID, corrupt-content, checksum, and incomplete-day-edge fixtures
+      quarantine; changed code or policy never reuses old checkpoints.
 - [ ] The target-specific offline and prospective gates pass.
 - [ ] Independent validation, model card, signed artifacts, approvals, and
       limitations are present.

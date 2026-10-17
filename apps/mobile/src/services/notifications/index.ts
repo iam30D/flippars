@@ -3,6 +3,7 @@ import * as Notifications from "expo-notifications";
 import { Platform } from "react-native";
 import type { GuestPreferencesView, SignalKind } from "../../domain/models";
 import { notificationEligibility } from "./eligibility";
+import type { ExistingNotificationRegistration } from "./registration";
 
 interface NotificationData {
   readonly signalId?: unknown;
@@ -25,11 +26,6 @@ const wireSignalKind = (value: unknown): SignalKind | null => {
 };
 
 let currentPreferences: GuestPreferencesView | null = null;
-
-export interface ExistingNotificationRegistration {
-  readonly token: string | null;
-  readonly status: "granted" | "denied" | "unknown" | "unavailable";
-}
 
 export const setNotificationPreferences = (preferences: GuestPreferencesView): void => {
   currentPreferences = preferences;
@@ -62,15 +58,17 @@ const nativeIosToken = async (): Promise<string | null> => {
   return /^[A-Fa-f0-9]{32,512}$/.test(normalized) ? normalized : null;
 };
 
-export const getExistingNotificationRegistration =
-  async (): Promise<ExistingNotificationRegistration> => {
-    if (!Device.isDevice) return { token: null, status: "unavailable" };
-    const current = await Notifications.getPermissionsAsync();
-    if (!current.granted)
-      return { token: null, status: current.canAskAgain ? "unknown" : "denied" };
-    const token = await nativeIosToken();
-    return { token, status: token ? "granted" : "unavailable" };
-  };
+export const getExistingNotificationRegistration = async (
+  includeToken = true,
+): Promise<ExistingNotificationRegistration> => {
+  if (!Device.isDevice) return { token: null, status: "unavailable" };
+  const current = await Notifications.getPermissionsAsync();
+  if (!current.granted)
+    return { token: null, status: current.canAskAgain ? "unknown" : "denied" };
+  if (!includeToken) return { token: null, status: "granted" };
+  const token = await nativeIosToken();
+  return { token, status: token ? "granted" : "unavailable" };
+};
 
 export const requestNotificationToken = async (): Promise<string | null> => {
   if (!Device.isDevice) return null;
@@ -88,6 +86,8 @@ export const requestNotificationToken = async (): Promise<string | null> => {
 
 export const clearDeliveredNotifications = (): Promise<void> =>
   Notifications.dismissAllNotificationsAsync();
+
+export type { ExistingNotificationRegistration } from "./registration";
 
 export const extractFreshSignalId = (
   response: Notifications.NotificationResponse,

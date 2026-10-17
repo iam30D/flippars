@@ -84,6 +84,8 @@ Device registration body:
 
 Preferences use the canonical guest contract, excluding the server-generated `updatedAt`. The body includes `installationId`, `enabledSignalTypes`, `notificationsEnabled`, `minimumConfidence`, `quietHours`, `showDemoData`, and `locale`.
 
+Guest device registration, preference replacement, and deletion require both `X-Flippars-Installation-ID` and `X-Flippars-Guest-Credential`. The identifier header must match the route parameter or preference body. The credential is a client-generated 256-bit hexadecimal secret; only its SHA-256 hash is stored. A pre-release row without a hash may claim a credential on its next device upsert or may be deleted with proof during migration. Migration `002_guest_device_credentials.sql` also changes notification consent to default false, disables every legacy notification preference, and removes legacy push-token associations so all guests must opt in explicitly under the new flow. Public market, candle, signal, health, documentation, metrics, and WebSocket routes do not require or receive guest proof.
+
 All request objects reject unknown fields. Errors use:
 
 ```json
@@ -112,7 +114,7 @@ The current normalized observation rate is capped at four writes per second. Eve
 
 Migration `001_initial.sql` creates:
 
-- anonymous devices and preferences;
+- anonymous devices, one-way guest mutation proofs, and preferences;
 - encrypted push tokens (AES-256-GCM at the repository boundary);
 - model registry and single-approved-model constraint;
 - operational market observations;
@@ -122,7 +124,7 @@ Migration `001_initial.sql` creates:
 
 Run a scheduled retention job using `retain_until` for operational observations and delivery records. Signal/audit retention must follow the approved model-risk and legal policy; signals are protected from mutation by a database trigger. Backups require equivalent encryption and deletion controls.
 
-No guest account or personally identifying profile exists. `DELETE /v1/devices/:id` cascades the installation’s preferences and notification-delivery metadata. Audit entries record actions without storing APNs tokens or request bodies.
+No guest account or personally identifying profile exists. `DELETE /v1/devices/:id` verifies guest proof and cascades the installation’s preferences and notification-delivery metadata. Repeating an authenticated deletion after the row is gone remains idempotent. Audit entries record actions without storing APNs tokens, raw guest credentials, installation IDs, or request bodies; application log redaction covers guest headers and mutation-body identifiers.
 
 ## APNs
 

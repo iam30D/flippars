@@ -359,10 +359,10 @@ describe("five-minute reversal semantics", () => {
 });
 
 describe("approved signal timing boundaries", () => {
-  it("opens 15-minute reversal eligibility at exactly 7:30 remaining", () => {
+  it("opens 15-minute reversal eligibility with exactly 10 minutes remaining", () => {
     const type = "FIFTEEN_MINUTE_REVERSAL";
-    const justBefore = time(449.999);
-    const boundary = time(450);
+    const justBefore = time(299.999);
+    const boundary = time(300);
 
     const early = new SignalEngine().evaluate({
       snapshot: snapshot(justBefore, "60100"),

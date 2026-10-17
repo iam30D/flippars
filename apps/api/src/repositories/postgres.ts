@@ -42,16 +42,17 @@ export class PostgresRepository implements Repository {
     }
   }
 
-  async upsertDevice(input: UpsertDeviceInput): Promise<DeviceRecord> {
+  async upsertDevice(input: UpsertDeviceInput): Promise<DeviceRecord | null> {
     const token = input.pushToken ? this.encryptToken(input.pushToken) : null;
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
       const result = await client.query<DatabaseRow>(
         `INSERT INTO guest_devices
-          (id, platform, push_token_ciphertext, push_environment, notifications_authorized, app_version, locale, timezone)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+          (id, credential_hash, platform, push_token_ciphertext, push_environment, notifications_authorized, app_version, locale, timezone)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          ON CONFLICT (id) DO UPDATE SET
+          credential_hash = COALESCE(guest_devices.credential_hash, EXCLUDED.credential_hash),
           push_token_ciphertext = EXCLUDED.push_token_ciphertext,
           push_environment = EXCLUDED.push_environment,
           notifications_authorized = EXCLUDED.notifications_authorized,
@@ -59,9 +60,12 @@ export class PostgresRepository implements Repository {
           locale = EXCLUDED.locale,
           timezone = EXCLUDED.timezone,
           updated_at = now(), last_seen_at = now(), retain_until = NULL
+         WHERE guest_devices.credential_hash IS NULL
+            OR guest_devices.credential_hash = EXCLUDED.credential_hash
          RETURNING *`,
         [
           input.id,
+          input.credentialHash,
           input.platform,
           token,
           input.pushEnvironment,
@@ -71,10 +75,14 @@ export class PostgresRepository implements Repository {
           input.timezone,
         ],
       );
+      if (!result.rows[0]) {
+        await client.query("ROLLBACK");
+        return null;
+      }
       await client.query(
         `INSERT INTO guest_preferences
           (device_id, notifications_enabled, signal_types, minimum_confidence, quiet_hours, show_demo_data, locale)
-         VALUES ($1, true, $2, 0.75, $3::jsonb, false, $4)
+         VALUES ($1, false, $2, 0.75, $3::jsonb, false, $4)
          ON CONFLICT (device_id) DO NOTHING`,
         [
           input.id,
@@ -84,7 +92,7 @@ export class PostgresRepository implements Repository {
         ],
       );
       await client.query("COMMIT");
-      return this.mapDevice(requiredRow(result.rows[0]));
+      return this.mapDevice(result.rows[0]);
     } catch (error) {
       await client.query("ROLLBACK");
       throw error;
@@ -93,12 +101,30 @@ export class PostgresRepository implements Repository {
     }
   }
 
-  async deleteDevice(id: string): Promise<boolean> {
-    const result = await this.pool.query<DatabaseRow>(
-      "DELETE FROM guest_devices WHERE id = $1",
-      [id],
+  async verifyDeviceCredential(id: string, credentialHash: string): Promise<boolean> {
+    const result = await this.pool.query(
+      "SELECT 1 FROM guest_devices WHERE id = $1 AND credential_hash = $2",
+      [id, credentialHash],
     );
     return (result.rowCount ?? 0) > 0;
+  }
+
+  async deleteDevice(
+    id: string,
+    credentialHash: string,
+  ): Promise<"deleted" | "not_found" | "credential_mismatch"> {
+    const result = await this.pool.query<DatabaseRow>(
+      `DELETE FROM guest_devices
+       WHERE id = $1 AND (credential_hash = $2 OR credential_hash IS NULL)
+       RETURNING id`,
+      [id, credentialHash],
+    );
+    if ((result.rowCount ?? 0) > 0) return "deleted";
+    const existing = await this.pool.query(
+      "SELECT 1 FROM guest_devices WHERE id = $1",
+      [id],
+    );
+    return existing.rowCount ? "credential_mismatch" : "not_found";
   }
 
   async putPreferences(input: PutPreferencesInput): Promise<PreferencesRecord> {

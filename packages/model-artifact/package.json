@@ -1,0 +1,40 @@
+{
+  "name": "@flippars/model-artifact",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Strict offline contracts and verification for governed Flippars model bundles.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "flippars-model-bundle-verify": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "tsc -p tsconfig.json --build --clean",
+    "test": "npm run build && node --test dist/model-artifact.test.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "verify:bundle": "npm run build && node dist/cli.js"
+  },
+  "dependencies": {
+    "@flippars/contracts": "0.1.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.4",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=20.19 <21"
+  }
+}

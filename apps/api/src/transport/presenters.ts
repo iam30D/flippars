@@ -350,6 +350,8 @@ function fallbackSignal(
     audit: {
       decisionId: `decision:${record.id}`,
       engineVersion: "api-adapter/1",
+      // This path reconstructs historical rows that predate canonical audit storage.
+      // Never relabel those legacy decisions with the current policy version.
       policyVersion: "precision-first/1",
       inputSnapshotId: `snapshot:${record.issuedAt}`,
       forecastId: `forecast:${record.id}`,

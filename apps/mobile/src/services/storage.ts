@@ -8,6 +8,7 @@ export const storageKeys = {
   preferences: `${PREFIX}/preferences`,
   signals: `${PREFIX}/signals`,
   market: `${PREFIX}/market`,
+  notificationOptIn: `${PREFIX}/notification-opt-in`,
 } as const;
 
 const readJson = async <T>(key: string): Promise<T | null> => {
@@ -112,6 +113,12 @@ export const readOnboardingComplete = async (): Promise<boolean> =>
 
 export const writeOnboardingComplete = (): Promise<void> =>
   AsyncStorage.setItem(storageKeys.onboarding, "true");
+
+export const readNotificationOptIn = async (): Promise<boolean> =>
+  (await AsyncStorage.getItem(storageKeys.notificationOptIn)) === "true";
+
+export const writeNotificationOptIn = (enabled: boolean): Promise<void> =>
+  AsyncStorage.setItem(storageKeys.notificationOptIn, enabled ? "true" : "false");
 
 export const readPreferences = async (): Promise<GuestPreferencesView | null> => {
   const value = await readJson<unknown>(storageKeys.preferences);

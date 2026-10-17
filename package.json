@@ -19,7 +19,7 @@
   },
   "scripts": {
     "build": "npm run build:shared && npm run build --workspace @flippars/model-lab && npm run build --workspace @flippars/api && npm run build --workspace @flippars/mobile",
-    "build:shared": "npm run build --workspace @flippars/contracts && npm run build --workspace @flippars/signal-core",
+    "build:shared": "npm run build --workspace @flippars/contracts && npm run build --workspace @flippars/signal-core && npm run build --workspace @flippars/model-artifact",
     "clean": "npm run clean --workspaces --if-present",
     "dev:api": "npm run dev --workspace @flippars/api",
     "dev:mobile": "npm run start --workspace @flippars/mobile",
@@ -29,7 +29,17 @@
     "test": "npm run build:shared && npm run test --workspaces --if-present",
     "typecheck": "npm run build:shared && npm run typecheck --workspaces --if-present",
     "repo:check": "node scripts/check-repository.mjs",
-    "verify": "npm run repo:check && npm run format:check && npm run lint && npm run typecheck && npm run test && npm run build"
+    "model:review": "node scripts/review-model-evaluation.mjs",
+    "capture:market": "node --import tsx apps/api/src/research/capture-cli.ts",
+    "capture:market:long": "node --import tsx apps/api/src/research/capture-long-cli.ts",
+    "capture:market:observed": "node --import tsx apps/api/src/research/capture-observed-cli.ts",
+    "capture:market:isolated": "node --import tsx apps/api/src/research/capture-isolated-cli.ts",
+    "capture:verify": "node --import tsx apps/api/src/research/capture-verifier.ts",
+    "research:audit-capture": "node --import tsx apps/api/src/research/capture-decision-audit.ts",
+    "research:audit-quality": "node --import tsx apps/api/src/research/capture-quality-audit.ts",
+    "research:replay-capture": "node --import tsx apps/api/src/research/population-replay-cli.ts",
+    "test:model-review": "node --test scripts/review-model-evaluation.test.mjs",
+    "verify": "npm run repo:check && npm run format:check && npm run lint && npm run typecheck && npm run test:model-review && npm run test && npm run build"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",

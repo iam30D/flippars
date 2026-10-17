@@ -8,5 +8,5 @@
     "noFallthroughCasesInSwitch": true,
     "types": ["node"]
   },
-  "include": ["app", "src", "app.config.ts", "expo-env.d.ts"]
+  "include": ["app", "src", "app.config.ts", "env.d.ts", ".expo/types/**/*.ts"]
 }

@@ -7,15 +7,24 @@
     "development": {
       "developmentClient": true,
       "distribution": "internal",
-      "environment": "development"
+      "environment": "development",
+      "env": {
+        "FLIPPARS_BUILD_PROFILE": "development"
+      }
     },
     "preview": {
       "distribution": "internal",
-      "environment": "preview"
+      "environment": "preview",
+      "env": {
+        "FLIPPARS_BUILD_PROFILE": "preview"
+      }
     },
     "production": {
       "autoIncrement": true,
-      "environment": "production"
+      "environment": "production",
+      "env": {
+        "FLIPPARS_BUILD_PROFILE": "production"
+      }
     }
   },
   "submit": {

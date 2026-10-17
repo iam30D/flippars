@@ -1,4 +1,5 @@
 import { AppState } from "react-native";
+import Constants from "expo-constants";
 import type { PropsWithChildren } from "react";
 import {
   createContext,
@@ -21,18 +22,24 @@ import { mergeSignals } from "../services/api/recovery";
 import { SignalStream } from "../services/api/stream";
 import { DemoRepository } from "../services/demo";
 import {
-  deleteInstallationId,
-  getOrCreateInstallationId,
+  confirmPendingGuestDeletion,
+  getOrCreateGuestSession,
+  queuePendingGuestDeletion,
+  readPendingGuestDeletions,
+  rotateGuestSession,
+  type GuestSession,
 } from "../services/installation";
 import {
   clearFlipparsStorage,
   readCachedMarket,
   readCachedSignals,
   readOnboardingComplete,
+  readNotificationOptIn,
   readPreferences,
   writeCachedMarket,
   writeCachedSignals,
   writeOnboardingComplete,
+  writeNotificationOptIn,
   writePreferences,
 } from "../services/storage";
 import {
@@ -42,6 +49,7 @@ import {
   type ExistingNotificationRegistration,
   setNotificationPreferences,
 } from "../services/notifications";
+import { notificationSyncDecision } from "../services/notifications/registration";
 
 type NotificationStatus = "unknown" | "granted" | "denied" | "unavailable";
 
@@ -53,6 +61,7 @@ interface AppContextValue {
   readonly signals: readonly SignalView[];
   readonly preferences: GuestPreferencesView;
   readonly notificationStatus: NotificationStatus;
+  readonly notificationsOptedIn: boolean;
   readonly refreshing: boolean;
   readonly historyLoading: boolean;
   readonly historyCursor: string | null;
@@ -62,6 +71,7 @@ interface AppContextValue {
   readonly fetchSignal: (id: string) => Promise<SignalView | null>;
   readonly completeOnboarding: (enableNotifications: boolean) => Promise<void>;
   readonly enableNotifications: () => Promise<boolean>;
+  readonly disableNotifications: () => Promise<void>;
   readonly updatePreferences: (preferences: GuestPreferencesView) => Promise<void>;
   readonly resetAnonymousData: () => Promise<void>;
 }
@@ -77,17 +87,31 @@ const initialMarket: MarketView = {
 };
 
 const AppContext = createContext<AppContextValue | null>(null);
+const appVersion = Constants.expoConfig?.version?.trim() || "unknown";
+
+const retryPendingGuestDeletions = async (apiUrl: string): Promise<void> => {
+  const pending = await readPendingGuestDeletions();
+  for (const session of pending) {
+    try {
+      await new ApiClient(apiUrl, session).deleteDevice();
+      await confirmPendingGuestDeletion(session.installationId);
+    } catch {
+      break;
+    }
+  }
+};
 
 export const AppProvider = ({ children }: PropsWithChildren): React.JSX.Element => {
   const [ready, setReady] = useState(false);
   const [onboardingComplete, setOnboardingComplete] = useState(false);
-  const [installationId, setInstallationId] = useState<string | null>(null);
+  const [guestSession, setGuestSession] = useState<GuestSession | null>(null);
   const [market, setMarket] = useState<MarketView>(initialMarket);
   const [signals, setSignals] = useState<readonly SignalView[]>([]);
   const [preferences, setPreferences] =
     useState<GuestPreferencesView>(DEFAULT_PREFERENCES);
   const [notificationStatus, setNotificationStatus] =
     useState<NotificationStatus>("unknown");
+  const [notificationsOptedIn, setNotificationsOptedIn] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyCursor, setHistoryCursor] = useState<string | null>(null);
@@ -102,28 +126,39 @@ export const AppProvider = ({ children }: PropsWithChildren): React.JSX.Element 
   useEffect(() => {
     let active = true;
     void Promise.all([
-      getOrCreateInstallationId(),
+      getOrCreateGuestSession(),
       readOnboardingComplete(),
+      readNotificationOptIn(),
       readPreferences(),
       readCachedSignals(),
       readCachedMarket(),
     ])
-      .then(([id, onboarded, savedPreferences, cachedSignals, cachedMarket]) => {
-        if (!active) return;
-        const resolvedPreferences = savedPreferences ?? DEFAULT_PREFERENCES;
-        setInstallationId(id);
-        setOnboardingComplete(onboarded);
-        setPreferences(resolvedPreferences);
-        setNotificationPreferences(resolvedPreferences);
-        if (cachedSignals) setSignals(cachedSignals);
-        if (cachedMarket)
-          setMarket({
-            ...cachedMarket,
-            health: "connecting",
-            healthMessage: "Restoring a fresh market connection.",
-          });
-        setReady(true);
-      })
+      .then(
+        ([
+          session,
+          onboarded,
+          optedIn,
+          savedPreferences,
+          cachedSignals,
+          cachedMarket,
+        ]) => {
+          if (!active) return;
+          const resolvedPreferences = savedPreferences ?? DEFAULT_PREFERENCES;
+          setGuestSession(session);
+          setOnboardingComplete(onboarded);
+          setNotificationsOptedIn(optedIn);
+          setPreferences(resolvedPreferences);
+          setNotificationPreferences(resolvedPreferences);
+          if (cachedSignals) setSignals(cachedSignals);
+          if (cachedMarket)
+            setMarket({
+              ...cachedMarket,
+              health: "connecting",
+              healthMessage: "Restoring a fresh market connection.",
+            });
+          setReady(true);
+        },
+      )
       .catch(() => {
         if (!active) return;
         setMarket({
@@ -164,7 +199,7 @@ export const AppProvider = ({ children }: PropsWithChildren): React.JSX.Element 
   }, []);
 
   const refresh = useCallback(async (): Promise<void> => {
-    if (!ready || !installationId) return;
+    if (!ready || !guestSession) return;
     setRefreshing(true);
     try {
       if (env.demoMode) {
@@ -194,10 +229,10 @@ export const AppProvider = ({ children }: PropsWithChildren): React.JSX.Element 
     } finally {
       setRefreshing(false);
     }
-  }, [installationId, ready, recoverLiveState]);
+  }, [guestSession, ready, recoverLiveState]);
 
   useEffect(() => {
-    if (!ready || !installationId) return;
+    if (!ready || !guestSession) return;
     if (env.demoMode) {
       void refresh();
       const interval = setInterval(
@@ -212,22 +247,25 @@ export const AppProvider = ({ children }: PropsWithChildren): React.JSX.Element 
       );
       return () => clearInterval(interval);
     }
-    if (!env.apiUrl) {
+    const apiUrl = env.apiUrl;
+    if (!apiUrl) {
       void refresh();
       return;
     }
-    const api = new ApiClient(env.apiUrl, installationId);
+    const api = new ApiClient(apiUrl, guestSession);
     apiRef.current = api;
     const deviceRegistration = (async (): Promise<void> => {
       let registration: ExistingNotificationRegistration;
       try {
-        registration = await getExistingNotificationRegistration();
+        await retryPendingGuestDeletions(apiUrl);
+        registration = await getExistingNotificationRegistration(notificationsOptedIn);
       } catch {
         registration = { token: null, status: "unavailable" as const };
       }
       setNotificationStatus(registration.status);
-      await api.registerDevice(registration.token);
-      await api.updatePreferences(preferences, registration.status === "granted");
+      const sync = notificationSyncDecision(notificationsOptedIn, registration);
+      await api.registerDevice(sync.pushToken, appVersion);
+      await api.updatePreferences(preferences, sync.notificationsEnabled);
     })();
     deviceRegistrationRef.current = deviceRegistration;
     void deviceRegistration.catch(() => {
@@ -235,7 +273,7 @@ export const AppProvider = ({ children }: PropsWithChildren): React.JSX.Element 
         "Anonymous notification preferences could not be synchronized yet.",
       );
     });
-    const stream = new SignalStream(env.apiUrl, {
+    const stream = new SignalStream(apiUrl, {
       onConnected: () => {
         void recoverLiveState().catch(() => {
           setMarket((current) => ({
@@ -294,7 +332,8 @@ export const AppProvider = ({ children }: PropsWithChildren): React.JSX.Element 
     };
   }, [
     applySignal,
-    installationId,
+    guestSession,
+    notificationsOptedIn,
     preferences.reducedData,
     ready,
     recoverLiveState,
@@ -318,46 +357,70 @@ export const AppProvider = ({ children }: PropsWithChildren): React.JSX.Element 
     const subscription = AppState.addEventListener("change", (state) => {
       if (state !== "active") return;
       void refresh();
-      void getExistingNotificationRegistration()
+      if (env.apiUrl)
+        void retryPendingGuestDeletions(env.apiUrl).catch(() => undefined);
+      void getExistingNotificationRegistration(notificationsOptedIn)
         .then(async (registration) => {
           setNotificationStatus(registration.status);
           const api = apiRef.current;
           if (!api) return;
-          await api.registerDevice(registration.token);
-          await api.updatePreferences(preferences, registration.status === "granted");
+          const sync = notificationSyncDecision(notificationsOptedIn, registration);
+          await api.registerDevice(sync.pushToken, appVersion);
+          await api.updatePreferences(preferences, sync.notificationsEnabled);
         })
         .catch(() => {
           // Market refresh remains independent when native notification state is unavailable.
         });
     });
     return () => subscription.remove();
-  }, [preferences, refresh]);
+  }, [notificationsOptedIn, preferences, refresh]);
 
   const enableNotifications = useCallback(async (): Promise<boolean> => {
+    let token: string | null;
     try {
-      const token = await requestNotificationToken();
+      token = await requestNotificationToken();
       if (!token) {
-        const registration = await getExistingNotificationRegistration();
+        const registration = await getExistingNotificationRegistration(false);
         setNotificationStatus(registration.status);
         return false;
       }
-      await apiRef.current?.registerDevice(token);
-      await apiRef.current?.updatePreferences(preferences, true);
-      setNotificationStatus("granted");
-      return true;
     } catch {
       setNotificationStatus("denied");
       return false;
+    }
+    await writeNotificationOptIn(true);
+    setNotificationsOptedIn(true);
+    setNotificationStatus("granted");
+    try {
+      await apiRef.current?.registerDevice(token, appVersion);
+      await apiRef.current?.updatePreferences(preferences, true);
+    } catch {
+      setErrorMessage(
+        "Signal alert registration will retry when the service reconnects.",
+      );
+    }
+    return true;
+  }, [preferences]);
+
+  const disableNotifications = useCallback(async (): Promise<void> => {
+    await writeNotificationOptIn(false);
+    setNotificationsOptedIn(false);
+    try {
+      await apiRef.current?.registerDevice(null, appVersion);
+      await apiRef.current?.updatePreferences(preferences, false);
+    } catch {
+      setErrorMessage("Signal alert removal will retry when the service reconnects.");
     }
   }, [preferences]);
 
   const completeOnboarding = useCallback(
     async (shouldEnableNotifications: boolean): Promise<void> => {
       if (shouldEnableNotifications) await enableNotifications();
+      else await disableNotifications();
       await writeOnboardingComplete();
       setOnboardingComplete(true);
     },
-    [enableNotifications],
+    [disableNotifications, enableNotifications],
   );
 
   const updatePreferences = useCallback(
@@ -377,16 +440,19 @@ export const AppProvider = ({ children }: PropsWithChildren): React.JSX.Element 
           try {
             await api.updatePreferences(
               nextPreferences,
-              notificationStatus === "granted",
+              notificationsOptedIn && notificationStatus === "granted",
             );
           } catch (error) {
-            if (!(error instanceof ApiError) || error.status !== 404) throw error;
-            const registration = await getExistingNotificationRegistration();
-            await api.registerDevice(registration.token);
-            await api.updatePreferences(
-              nextPreferences,
-              registration.status === "granted",
-            );
+            if (
+              !(error instanceof ApiError) ||
+              (error.status !== 403 && error.status !== 404)
+            )
+              throw error;
+            const registration =
+              await getExistingNotificationRegistration(notificationsOptedIn);
+            const sync = notificationSyncDecision(notificationsOptedIn, registration);
+            await api.registerDevice(sync.pushToken, appVersion);
+            await api.updatePreferences(nextPreferences, sync.notificationsEnabled);
             setNotificationStatus(registration.status);
           }
         }
@@ -397,7 +463,7 @@ export const AppProvider = ({ children }: PropsWithChildren): React.JSX.Element 
         setErrorMessage("Preference sync failed; your previous choices were restored.");
       }
     },
-    [notificationStatus, preferences],
+    [notificationStatus, notificationsOptedIn, preferences],
   );
 
   const loadMoreHistory = useCallback(async (): Promise<void> => {
@@ -433,30 +499,39 @@ export const AppProvider = ({ children }: PropsWithChildren): React.JSX.Element 
   );
 
   const resetAnonymousData = useCallback(async (): Promise<void> => {
+    const session = guestSession;
+    if (!session) throw new Error("Guest session is not ready");
     try {
       await deviceRegistrationRef.current;
     } catch {
       // Continue deletion even if initial registration never reached the service.
     }
-    try {
-      await apiRef.current?.deleteDevice();
-    } catch {
-      // Local deletion must still complete when the server is unavailable.
-    }
+    await queuePendingGuestDeletion(session);
+    let serverDeletionConfirmed = false;
+    if (!env.demoMode && env.apiUrl)
+      try {
+        await new ApiClient(env.apiUrl, session).deleteDevice();
+        serverDeletionConfirmed = true;
+      } catch {
+        // The encrypted tombstone remains for a later foreground retry.
+      }
     streamRef.current?.stop();
+    apiRef.current = null;
+    const freshSession = await rotateGuestSession();
+    if (serverDeletionConfirmed)
+      await confirmPendingGuestDeletion(session.installationId).catch(() => undefined);
     await clearFlipparsStorage();
     await clearDeliveredNotifications();
-    await deleteInstallationId();
-    const freshId = await getOrCreateInstallationId();
-    setInstallationId(freshId);
+    setGuestSession(freshSession);
     setSignals([]);
     setMarket(initialMarket);
     setPreferences(DEFAULT_PREFERENCES);
     setNotificationPreferences(DEFAULT_PREFERENCES);
+    setNotificationsOptedIn(false);
     setNotificationStatus("unknown");
     setOnboardingComplete(false);
     setErrorMessage(null);
-  }, []);
+  }, [guestSession]);
 
   const value = useMemo<AppContextValue>(
     () => ({
@@ -467,6 +542,7 @@ export const AppProvider = ({ children }: PropsWithChildren): React.JSX.Element 
       signals,
       preferences,
       notificationStatus,
+      notificationsOptedIn,
       refreshing,
       historyLoading,
       historyCursor,
@@ -476,11 +552,13 @@ export const AppProvider = ({ children }: PropsWithChildren): React.JSX.Element 
       fetchSignal,
       completeOnboarding,
       enableNotifications,
+      disableNotifications,
       updatePreferences,
       resetAnonymousData,
     }),
     [
       completeOnboarding,
+      disableNotifications,
       enableNotifications,
       errorMessage,
       fetchSignal,
@@ -489,6 +567,7 @@ export const AppProvider = ({ children }: PropsWithChildren): React.JSX.Element 
       loadMoreHistory,
       market,
       notificationStatus,
+      notificationsOptedIn,
       onboardingComplete,
       preferences,
       ready,

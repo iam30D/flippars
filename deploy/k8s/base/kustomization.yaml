@@ -6,6 +6,8 @@ resources:
   - configmap.yaml
   - deployment.yaml
   - service.yaml
+  - retention-cronjob.yaml
   - pdb.yaml
   - hpa.yaml
   - network-policy.yaml
+  - operations-network-policy.yaml

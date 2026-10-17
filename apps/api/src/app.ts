@@ -9,9 +9,17 @@ import Fastify, {
   LogController,
   type FastifyInstance,
   type FastifyPluginCallback,
+  type FastifyRequest,
   type FastifyServerOptions,
 } from "fastify";
-import type { DataMode, SignalType as WireSignalType } from "@flippars/contracts";
+import {
+  GUEST_CREDENTIAL_HEADER,
+  GUEST_INSTALLATION_ID_HEADER,
+  GuestCredentialSchema,
+  GuestInstallationIdSchema,
+  type DataMode,
+  type SignalType as WireSignalType,
+} from "@flippars/contracts";
 import type { AppConfig } from "./config.js";
 import { ApiError, errorHandler } from "./errors.js";
 import type { MarketCoordinator } from "./market/coordinator.js";
@@ -108,8 +116,13 @@ export async function buildApi(
         paths: [
           "req.headers.authorization",
           "req.headers.cookie",
+          "req.headers.x-flippars-installation-id",
+          "req.headers.x-flippars-guest-credential",
+          "req.body.installationId",
           "req.body.pushToken",
+          "body.installationId",
           "body.pushToken",
+          "*.installationId",
           "*.pushToken",
           "res.headers.set-cookie",
         ],
@@ -436,9 +449,11 @@ export async function buildApi(
         summary: "Register or refresh an anonymous iOS installation",
         params: installationParamsSchema,
         body: deviceBodySchema,
+        response: { 401: errorResponseSchema, 403: errorResponseSchema },
       },
     },
     async (request) => {
+      const credentialHash = guestCredentialHash(request, request.params.id);
       assertTimeZone(request.body.timeZone);
       assertLocale(request.body.locale);
       if (!request.body.notificationsAuthorized && request.body.pushToken !== null) {
@@ -450,6 +465,7 @@ export async function buildApi(
       }
       const device = await repository.upsertDevice({
         id: request.params.id,
+        credentialHash,
         platform: "ios",
         pushToken: request.body.pushToken,
         pushEnvironment: request.body.pushEnvironment,
@@ -458,6 +474,12 @@ export async function buildApi(
         locale: request.body.locale,
         timezone: request.body.timeZone,
       });
+      if (!device)
+        throw new ApiError(
+          403,
+          "GUEST_CREDENTIAL_INVALID",
+          "The guest installation credential is invalid",
+        );
       await audit(
         repository,
         "guest_device.upserted",
@@ -477,10 +499,18 @@ export async function buildApi(
         tags: ["guest"],
         summary: "Delete an anonymous installation and associated personal data",
         params: installationParamsSchema,
+        response: { 401: errorResponseSchema, 403: errorResponseSchema },
       },
     },
     async (request, reply) => {
-      await repository.deleteDevice(request.params.id);
+      const credentialHash = guestCredentialHash(request, request.params.id);
+      const deletion = await repository.deleteDevice(request.params.id, credentialHash);
+      if (deletion === "credential_mismatch")
+        throw new ApiError(
+          403,
+          "GUEST_CREDENTIAL_INVALID",
+          "The guest installation credential is invalid",
+        );
       await audit(
         repository,
         "guest_device.deleted",
@@ -500,17 +530,23 @@ export async function buildApi(
         tags: ["guest"],
         summary: "Replace guest notification preferences",
         body: preferencesBodySchema,
-        response: { 404: errorResponseSchema },
+        response: { 401: errorResponseSchema, 403: errorResponseSchema },
       },
     },
     async (request) => {
+      const credentialHash = guestCredentialHash(request, request.body.installationId);
       assertTimeZone(request.body.quietHours.timeZone);
       assertLocale(request.body.locale);
-      if (!(await repository.getPreferences(request.body.installationId))) {
+      if (
+        !(await repository.verifyDeviceCredential(
+          request.body.installationId,
+          credentialHash,
+        ))
+      ) {
         throw new ApiError(
-          404,
-          "DEVICE_NOT_FOUND",
-          "Register the anonymous installation before saving preferences",
+          403,
+          "GUEST_CREDENTIAL_INVALID",
+          "Register the guest installation with the matching credential before saving preferences",
         );
       }
       const preferences = await repository.putPreferences({
@@ -626,6 +662,33 @@ async function audit(
 
 function pseudonymousAuditId(value: string): string {
   return `installation_hash:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function guestCredentialHash(
+  request: FastifyRequest,
+  expectedInstallationId: string,
+): string {
+  const rawInstallationId = request.headers[GUEST_INSTALLATION_ID_HEADER.toLowerCase()];
+  const rawCredential = request.headers[GUEST_CREDENTIAL_HEADER.toLowerCase()];
+  if (typeof rawInstallationId !== "string" || typeof rawCredential !== "string")
+    throw new ApiError(
+      401,
+      "GUEST_CREDENTIAL_REQUIRED",
+      "Guest mutation credentials are required",
+    );
+  const installationId = GuestInstallationIdSchema.safeParse(rawInstallationId);
+  const credential = GuestCredentialSchema.safeParse(rawCredential);
+  if (
+    !installationId.success ||
+    installationId.data !== expectedInstallationId ||
+    !credential.success
+  )
+    throw new ApiError(
+      403,
+      "GUEST_CREDENTIAL_INVALID",
+      "The guest installation credential is invalid",
+    );
+  return createHash("sha256").update(credential.data, "utf8").digest("hex");
 }
 
 function assertTimeZone(value: string): void {

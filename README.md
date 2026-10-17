@@ -16,7 +16,7 @@ The platform supports three independently governed targets:
 1. **Five-minute reversal** — while the current composite remains above the
    interval open, forecast a close below the open, or the exact inverse.
 2. **Fifteen-minute reversal** — the same opposite-side close target, eligible
-   only in the final 7 minutes 30 seconds of the interval.
+   only in the final 10 minutes of the interval.
 3. **Five-minute early direction** — during the first 60 seconds, forecast the
    final side of the five-minute close.
 
@@ -32,6 +32,7 @@ apps/api/                 Fastify API, ingestion, orchestration, APNs
 apps/mobile/              Expo/React Native iPhone client
 packages/contracts/       Versioned API and WebSocket schemas
 packages/signal-core/     Deterministic composite, candle, risk, and signal logic
+packages/model-artifact/  Signed model-bundle schemas and offline verification
 packages/model-lab/       Chronological draft challenger training/calibration
 deploy/k8s/               Portable Kubernetes deployment baseline
 docs/                     Product, architecture, governance, and operations
@@ -72,14 +73,19 @@ npm run verify
 npm audit --omit=dev --audit-level=high
 ```
 
-Docker and iOS cloud-build instructions are documented in
-[docs/development.md](docs/development.md). Model promotion and launch controls
-are documented in [docs/model-governance.md](docs/model-governance.md).
+Start with the beginner-friendly
+[iPhone development-build guide](docs/development-build.md), then use the
+[guest-first production setup guide](docs/production-setup.md). Additional
+engineering details are in [docs/development.md](docs/development.md). Model
+promotion and launch controls are documented in
+[docs/model-governance.md](docs/model-governance.md).
 
 ## Production status
 
-The repository contains the deployable application, tests, migration path,
-observability hooks, and infrastructure baseline. A public financial-signal
+The repository contains the guest-access application, tests, migration path,
+observability hooks, and infrastructure baseline. The guest information release
+has no login, subscription, entitlement, or paywall. A public financial-signal
 release additionally requires licensed provider agreements, a jurisdictional
 legal review, APNs/App Store credentials, an independent security assessment,
-and prospective model validation. Those are release gates, not code shortcuts.
+and prospective model validation. Those are release gates, not code shortcuts;
+until then, production signal emission remains disabled.

@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flippars-model-training"
+version = "0.1.0"
+description = "Offline Binance market-data collection and draft Flippars model training."
+requires-python = ">=3.11,<3.15"
+
+[tool.setuptools.packages.find]
+where = ["src"]

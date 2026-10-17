@@ -13,7 +13,7 @@ package performs no network I/O and never places trades.
 - Demo and simulation artifacts can never masquerade as live data.
 - Reversal alerts require current price to remain on the opposite side of the
   open from the predicted close.
-- Fifteen-minute reversal alerts begin only in the final 7 minutes 30 seconds.
+- Fifteen-minute reversal alerts begin only in the final 10 minutes.
 - Early five-minute direction alerts end at 60 seconds.
 - One alert is emitted per signal type and UTC window.
 - Abnormal-market risk suppresses forecasts; it never alleges intent.

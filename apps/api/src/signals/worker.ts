@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { FIFTEEN_MINUTE_REVERSAL_START_SECONDS } from "@flippars/contracts";
 import type {
   MarketSnapshot,
   ModelRecord,
@@ -26,6 +27,20 @@ export interface SignalWorkerOptions {
   confidenceThreshold: number;
   minimumLeadTimeMs: number;
   dataMode: "live" | "simulation";
+}
+
+export function signalPhaseAbstentionReason(
+  type: SignalType,
+  elapsedMs: number,
+): string | null {
+  if (
+    type === "fifteen_minute_reversal" &&
+    elapsedMs < FIFTEEN_MINUTE_REVERSAL_START_SECONDS * 1_000
+  )
+    return "outside_final_10m";
+  if (type === "five_minute_early_direction" && elapsedMs >= 60_000)
+    return "outside_first_60s";
+  return null;
 }
 
 export class SignalWorker {
@@ -93,10 +108,8 @@ export class SignalWorker {
     const remainingMs = candle.end - now;
     if (remainingMs < this.options.minimumLeadTimeMs)
       return this.abstain("insufficient_lead_time", type);
-    if (type === "fifteen_minute_reversal" && elapsedMs < 450_000)
-      return this.abstain("outside_final_7m30s", type);
-    if (type === "five_minute_early_direction" && elapsedMs > 60_000)
-      return this.abstain("outside_first_60s", type);
+    const phaseFailure = signalPhaseAbstentionReason(type, elapsedMs);
+    if (phaseFailure) return this.abstain(phaseFailure, type);
 
     const model = await this.approvedModel(type);
     if (!model || model.status !== "approved" || !model.approvedAt)

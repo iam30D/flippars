@@ -2,6 +2,10 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { afterEach, describe, test } from "node:test";
 import type { FastifyInstance } from "fastify";
+import {
+  GUEST_CREDENTIAL_HEADER,
+  GUEST_INSTALLATION_ID_HEADER,
+} from "@flippars/contracts";
 import { buildApi } from "../src/app.js";
 import { loadConfig } from "../src/config.js";
 import type {
@@ -19,10 +23,11 @@ import { InMemoryRepository } from "../src/repositories/memory.js";
 import { OutcomeEvaluator } from "../src/signals/outcomes.js";
 import { FakeModelRuntime } from "../src/signals/runtime.js";
 import { SafetyController } from "../src/signals/safety.js";
-import { SignalWorker } from "../src/signals/worker.js";
+import { SignalWorker, signalPhaseAbstentionReason } from "../src/signals/worker.js";
 import { presentMarketSnapshot } from "../src/transport/presenters.js";
 
 const apps: FastifyInstance[] = [];
+const guestCredential = "c".repeat(64);
 void afterEach(async () => {
   await Promise.allSettled(apps.splice(0).map((app) => app.close()));
 });
@@ -153,21 +158,26 @@ void describe("anonymous guest privacy", () => {
     const first = await app.inject({
       method: "PUT",
       url: `/v1/devices/${id}`,
+      headers: guestHeaders(id),
       payload: body,
     });
     const second = await app.inject({
       method: "PUT",
       url: `/v1/devices/${id}`,
+      headers: guestHeaders(id),
       payload: { ...body, appVersion: "1.0.1" },
     });
     assert.equal(first.statusCode, 200);
     assert.equal(second.statusCode, 200);
     assert.equal(repository.devices.size, 1);
+    assert.notEqual(repository.deviceCredentialHashes.get(id), guestCredential);
+    assert.equal(repository.preferences.get(id)?.notificationsEnabled, false);
     assert.equal(responseBody(second)["installationId"], id);
 
     const preferences = await app.inject({
       method: "PUT",
       url: "/v1/preferences",
+      headers: guestHeaders(id),
       payload: {
         installationId: id,
         enabledSignalTypes: ["FIVE_MINUTE_REVERSAL"],
@@ -188,7 +198,11 @@ void describe("anonymous guest privacy", () => {
       "FIVE_MINUTE_REVERSAL",
     ]);
 
-    const deleted = await app.inject({ method: "DELETE", url: `/v1/devices/${id}` });
+    const deleted = await app.inject({
+      method: "DELETE",
+      url: `/v1/devices/${id}`,
+      headers: guestHeaders(id),
+    });
     assert.equal(deleted.statusCode, 204);
     assert.equal(repository.devices.has(id), false);
     assert.equal(repository.preferences.has(id), false);
@@ -204,6 +218,7 @@ void describe("anonymous guest privacy", () => {
     const response = await app.inject({
       method: "PUT",
       url: `/v1/devices/${id}`,
+      headers: guestHeaders(id),
       payload: {
         platform: "IOS",
         appVersion: "1",
@@ -220,9 +235,90 @@ void describe("anonymous guest privacy", () => {
     assert.equal(error["code"], "VALIDATION_ERROR");
     assert.ok(error["requestId"]);
   });
+
+  void test("guest mutations require matching per-installation proof", async () => {
+    const { app, repository } = await fixture();
+    const id = randomUUID();
+    const body = {
+      platform: "IOS",
+      appVersion: "1.0.0",
+      locale: "en",
+      timeZone: "UTC",
+      pushToken: null,
+      notificationsAuthorized: false,
+      pushEnvironment: "sandbox",
+    };
+    const missing = await app.inject({
+      method: "PUT",
+      url: `/v1/devices/${id}`,
+      payload: body,
+    });
+    assert.equal(missing.statusCode, 401);
+
+    const registered = await app.inject({
+      method: "PUT",
+      url: `/v1/devices/${id}`,
+      headers: guestHeaders(id),
+      payload: body,
+    });
+    assert.equal(registered.statusCode, 200);
+
+    const wrongCredential = "d".repeat(64);
+    const takeover = await app.inject({
+      method: "PUT",
+      url: `/v1/devices/${id}`,
+      headers: guestHeaders(id, wrongCredential),
+      payload: { ...body, pushToken: "e".repeat(64), notificationsAuthorized: true },
+    });
+    assert.equal(takeover.statusCode, 403);
+    assert.equal(repository.devices.get(id)?.pushToken, null);
+
+    const preferenceTakeover = await app.inject({
+      method: "PUT",
+      url: "/v1/preferences",
+      headers: guestHeaders(id, wrongCredential),
+      payload: {
+        installationId: id,
+        enabledSignalTypes: ["FIVE_MINUTE_REVERSAL"],
+        notificationsEnabled: true,
+        minimumConfidence: 0.75,
+        quietHours: { enabled: false, start: "22:00", end: "07:00", timeZone: "UTC" },
+        showDemoData: false,
+        locale: "en",
+      },
+    });
+    assert.equal(preferenceTakeover.statusCode, 403);
+
+    const wrongDelete = await app.inject({
+      method: "DELETE",
+      url: `/v1/devices/${id}`,
+      headers: guestHeaders(id, wrongCredential),
+    });
+    assert.equal(wrongDelete.statusCode, 403);
+    assert.equal(repository.devices.has(id), true);
+
+    const publicRead = await app.inject({ method: "GET", url: "/v1/signals" });
+    assert.equal(publicRead.statusCode, 200);
+  });
 });
 
 void describe("signal safety and idempotency", () => {
+  void test("opens the 15-minute reversal phase at exactly T+300s", () => {
+    assert.equal(
+      signalPhaseAbstentionReason("fifteen_minute_reversal", 299_999),
+      "outside_final_10m",
+    );
+    assert.equal(signalPhaseAbstentionReason("fifteen_minute_reversal", 300_000), null);
+    assert.equal(
+      signalPhaseAbstentionReason("five_minute_early_direction", 59_999),
+      null,
+    );
+    assert.equal(
+      signalPhaseAbstentionReason("five_minute_early_direction", 60_000),
+      "outside_first_60s",
+    );
+  });
+
   void test("unhealthy/stale market state suppresses otherwise high-confidence signal", async () => {
     const repository = new InMemoryRepository();
     repository.models.set("five_minute_reversal", {
@@ -296,6 +392,7 @@ void describe("signal safety and idempotency", () => {
     const deviceId = randomUUID();
     await repository.upsertDevice({
       id: deviceId,
+      credentialHash: "f".repeat(64),
       platform: "ios",
       pushToken: "b".repeat(64),
       pushEnvironment: "sandbox",
@@ -303,6 +400,15 @@ void describe("signal safety and idempotency", () => {
       appVersion: "1",
       locale: "en",
       timezone: "UTC",
+    });
+    await repository.putPreferences({
+      deviceId,
+      notificationsEnabled: true,
+      signalTypes: ["five_minute_reversal"],
+      minimumConfidence: 0.75,
+      quietHours: { enabled: false, start: "22:00", end: "07:00", timezone: "UTC" },
+      showDemoData: false,
+      locale: "en",
     });
     const apns = new FakeApnsClient();
     const dispatcher = new NotificationDispatcher(market, repository, apns, metrics);
@@ -448,6 +554,16 @@ function record(value: unknown): Record<string, unknown> {
 function array(value: unknown): unknown[] {
   if (!Array.isArray(value)) throw new TypeError("Expected an array response");
   return value as unknown[];
+}
+
+function guestHeaders(
+  installationId: string,
+  credential = guestCredential,
+): Record<string, string> {
+  return {
+    [GUEST_INSTALLATION_ID_HEADER]: installationId,
+    [GUEST_CREDENTIAL_HEADER]: credential,
+  };
 }
 
 function venueQuote(

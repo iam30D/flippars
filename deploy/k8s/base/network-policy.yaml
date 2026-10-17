@@ -21,5 +21,8 @@ spec:
           port: 53
         - protocol: TCP
           port: 443
+        # Binance's public market-data WebSocket endpoint uses TCP 9443.
+        - protocol: TCP
+          port: 9443
         - protocol: TCP
           port: 5432

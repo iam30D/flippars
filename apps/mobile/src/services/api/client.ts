@@ -12,6 +12,11 @@ import {
   unwrapData,
 } from "./adapters";
 import { minutesToClock } from "../../domain/time";
+import {
+  GUEST_CREDENTIAL_HEADER,
+  GUEST_INSTALLATION_ID_HEADER,
+} from "@flippars/contracts";
+import type { GuestSession } from "../installation";
 
 export class ApiError extends Error {
   public constructor(
@@ -28,19 +33,25 @@ interface RequestOptions {
   readonly method?: "GET" | "PUT" | "DELETE";
   readonly body?: unknown;
   readonly signal?: AbortSignal;
+  readonly guestAuthenticated?: boolean;
 }
 
 export class ApiClient {
   public constructor(
     private readonly baseUrl: string,
-    private readonly installationId: string,
+    private readonly guestSession?: GuestSession,
   ) {}
 
   private async request(path: string, options: RequestOptions = {}): Promise<unknown> {
     const headers: Record<string, string> = {
       Accept: "application/json",
-      "X-Flippars-Installation-ID": this.installationId,
     };
+    if (options.guestAuthenticated) {
+      if (!this.guestSession)
+        throw new Error("Guest mutation requires a secure session");
+      headers[GUEST_INSTALLATION_ID_HEADER] = this.guestSession.installationId;
+      headers[GUEST_CREDENTIAL_HEADER] = this.guestSession.credential;
+    }
     if (options.body !== undefined) headers["Content-Type"] = "application/json";
     const controller = new AbortController();
     const abortFromCaller = (): void => controller.abort();
@@ -138,8 +149,9 @@ export class ApiClient {
     const resolved = Intl.DateTimeFormat().resolvedOptions();
     await this.request("/v1/preferences", {
       method: "PUT",
+      guestAuthenticated: true,
       body: {
-        installationId: this.installationId,
+        installationId: this.requiredGuestSession().installationId,
         enabledSignalTypes: enabledSignalTypes.length
           ? enabledSignalTypes
           : ["FIVE_MINUTE_REVERSAL"],
@@ -157,13 +169,18 @@ export class ApiClient {
     });
   }
 
-  public async registerDevice(pushToken: string | null): Promise<void> {
+  public async registerDevice(
+    pushToken: string | null,
+    appVersion: string,
+  ): Promise<void> {
     const resolved = Intl.DateTimeFormat().resolvedOptions();
-    await this.request(`/v1/devices/${encodeURIComponent(this.installationId)}`, {
+    const installationId = this.requiredGuestSession().installationId;
+    await this.request(`/v1/devices/${encodeURIComponent(installationId)}`, {
       method: "PUT",
+      guestAuthenticated: true,
       body: {
         platform: "IOS",
-        appVersion: "0.1.0",
+        appVersion,
         locale: resolved.locale ?? "en",
         timeZone: resolved.timeZone ?? "UTC",
         pushToken,
@@ -174,9 +191,16 @@ export class ApiClient {
   }
 
   public async deleteDevice(): Promise<void> {
-    await this.request(`/v1/devices/${encodeURIComponent(this.installationId)}`, {
+    const installationId = this.requiredGuestSession().installationId;
+    await this.request(`/v1/devices/${encodeURIComponent(installationId)}`, {
       method: "DELETE",
+      guestAuthenticated: true,
     });
+  }
+
+  private requiredGuestSession(): GuestSession {
+    if (!this.guestSession) throw new Error("Guest mutation requires a secure session");
+    return this.guestSession;
   }
 
   public async ready(): Promise<boolean> {
